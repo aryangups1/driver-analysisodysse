@@ -1,0 +1,17 @@
+# Credentials — never commit
+config.py
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Large binary — regenerate with build_flow.py
+flow_data.parquet
+
+# Streamlit cache
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
