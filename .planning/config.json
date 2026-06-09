@@ -1,0 +1,17 @@
+{
+  "project": "Odysse Driver Analysis Dashboard",
+  "version": "2.0.0",
+  "workflow": {
+    "phases": true,
+    "research": false,
+    "uat": true,
+    "git_commits": false
+  },
+  "stack": {
+    "frontend": "Streamlit",
+    "charts": "Plotly Express",
+    "maps": "Folium",
+    "backend": "PostgreSQL (Azure)",
+    "language": "Python"
+  }
+}

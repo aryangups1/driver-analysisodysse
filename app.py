@@ -1,5 +1,5 @@
 import os
-import re
+import datetime
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -9,12 +9,11 @@ import folium
 from streamlit_folium import st_folium
 from config import DRIVER_NAMES, BAD_DRIVER_IDS, TOP_DRIVER_IDS
 import db
-from zones import enrich_zones, parse_dms, assign_zone, CENTER_LAT, CENTER_LON, GEOJSON_DATA, is_valid_london_trip, calc_true_rph, estimate_ping
+from zones import enrich_zones, parse_dms, assign_zone, CENTER_LAT, CENTER_LON, GEOJSON_DATA, calc_true_rph, estimate_ping
 
-_FLOW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow_data.parquet")
-
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Top Driver Analysis",
+    page_title="Odysse Driver Analysis",
     page_icon="🚖",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -22,1242 +21,1090 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+[data-testid="stSidebar"] { background:#ffffff !important; }
+[data-testid="stSidebar"] h1,
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] .stRadio > label { color:#1e1e2e !important; }
+[data-testid="stSidebar"] hr { border-color:#e2e8f0 !important; }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color:#64748b !important; }
 .metric-card {
-    background: #1e1e2e;
-    border-radius: 10px;
-    padding: 16px 20px;
-    border-left: 4px solid #f59e0b;
-    margin-bottom: 8px;
+    background:#1e1e2e;border-radius:8px;padding:16px 18px;
+    border-left:4px solid #f59e0b;margin-bottom:8px;
 }
-.metric-label { color: #9ca3af; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
-.metric-value { color: #f9fafb; font-size: 26px; font-weight: 700; }
-.metric-sub { color: #6b7280; font-size: 12px; }
+.metric-label{color:#9ca3af;font-size:12px;text-transform:uppercase;letter-spacing:.05em;}
+.metric-value{color:#f9fafb;font-size:26px;font-weight:700;}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ── Module-level constants ────────────────────────────────────────────────────
+_FLOW_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow_data.parquet")
+_CAT_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver_categories.csv")
+_WEST_LON    = -0.12
+_FLEET_RPH_DEFAULT    = 23.04
+_FLEET_ACCEPT_DEFAULT = 57.2
+_FLEET_UTIL_DEFAULT   = 68.2
+
+CAT_COLORS = {
+    "A":  "#22c55e",
+    "B1": "#4ade80",
+    "B2": "#60a5fa",
+    "C1": "#f59e0b",
+    "C2": "#fb923c",
+    "D":  "#ef4444",
+    None: "#94a3b8",
+    "—":  "#94a3b8",
+}
+CAT_LABELS = {
+    "A": "A — Elite", "B1": "B1 — Strong", "B2": "B2 — Solid",
+    "C1": "C1 — Developing", "C2": "C2 — Below avg", "D": "D — Low performer",
+    None: "Unclassified", "—": "Unclassified",
+}
+CAT_ORDER = [None, "D", "C2", "C1", "B2", "B1", "A"]
+
+# ── Zone analysis data loader ────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600)
+def _load_zone_trips(days_back=30):
+    from_date = (pd.Timestamp.now() - pd.Timedelta(days=days_back)).strftime("%Y-%m-%d")
+    return db.query("""
+        SELECT dim_driver_id, driver_full_name,
+               pickup_lat_long, dropoff_latlong,
+               trip_price_in_pound, distance_in_miles,
+               pickedup_trip_datetime, dropoff_trip_datetime
+        FROM rep_fact_trips
+        WHERE status IN ('completed','Finished')
+          AND pickup_lat_long  IS NOT NULL AND pickup_lat_long  != ''
+          AND dropoff_latlong  IS NOT NULL AND dropoff_latlong  != ''
+          AND distance_in_miles BETWEEN 0.3 AND 40
+          AND pickedup_trip_datetime >= %s
+        ORDER BY dim_driver_id, pickedup_trip_datetime
+    """, (from_date,))
+
+# ── Driver search (broader than db.search_drivers — covers rep_fact_trips) ───
+
+@st.cache_data(ttl=3600)
+def _search_drivers(name_fragment):
+    return db.query("""
+        SELECT DISTINCT dim_driver_id, MAX(driver_full_name) AS driver_full_name
+        FROM rep_fact_trips
+        WHERE UPPER(driver_full_name) LIKE UPPER(%s)
+          AND status IN ('completed','Finished')
+          AND driver_full_name IS NOT NULL AND driver_full_name <> ''
+        GROUP BY dim_driver_id
+        ORDER BY driver_full_name
+        LIMIT 30
+    """, (f"%{name_fragment}%",))
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _stat_card_html(title, rph, accept, util, color, rph_d=None, accept_d=None, util_d=None):
+    def _delta(val, inverse=False):
+        if val is None:
+            return ""
+        c = ("#22c55e" if val > 0 else "#ef4444") if not inverse else ("#ef4444" if val > 0 else "#22c55e")
+        sign = "+" if val > 0 else ""
+        return f'<span style="color:{c};font-size:11px;margin-left:6px;">{sign}{val:.1f}</span>'
+    rows = [
+        ("Revenue / hr",    f"£{rph:.2f}",   _delta(rph_d)),
+        ("Acceptance rate", f"{accept:.1f}%", _delta(accept_d, inverse=True)),
+        ("Utilisation",     f"{util:.1f}%",   _delta(util_d)),
+    ]
+    trs = "".join(
+        f'<tr><td style="padding:5px 0;color:#9ca3af;font-size:12px;">{lbl}</td>'
+        f'<td style="text-align:right;font-size:17px;font-weight:700;color:#f9fafb;">{val}</td>'
+        f'<td style="text-align:right;white-space:nowrap;">{delta}</td></tr>'
+        for lbl, val, delta in rows
+    )
+    return (
+        f'<div style="background:#1e1e2e;border-top:3px solid {color};border-radius:8px;padding:18px 20px;">'
+        f'<div style="color:{color};font-size:13px;font-weight:700;margin-bottom:12px;">{title}</div>'
+        f'<table style="width:100%;border-collapse:collapse;">{trs}</table>'
+        f'</div>'
+    )
+
+
+def _ff_zone_matrix(flow_raw):
+    df = enrich_zones(flow_raw[flow_raw["status"].isin(["completed", "Finished"])].copy())
+    df = df.dropna(subset=["pickup_zone", "dropoff_zone"])
+    df["pickup_zone"]  = df["pickup_zone"].astype(int)
+    df["dropoff_zone"] = df["dropoff_zone"].astype(int)
+    mat = df.groupby(["pickup_zone", "dropoff_zone"]).size().reset_index(name="trips")
+    total = mat["trips"].sum()
+    mat["pct"] = (mat["trips"] / total * 100).round(1)
+    pivot = mat.pivot(index="pickup_zone", columns="dropoff_zone", values="pct").fillna(0)
+    for z in range(1, 7):
+        if z not in pivot.index:   pivot.loc[z] = 0
+        if z not in pivot.columns: pivot[z]     = 0
+    return pivot.sort_index()[sorted(pivot.columns)]
+
+
+def _safe_cell(mat, r, c):
+    try:
+        return mat.loc[r, c]
+    except Exception:
+        return 0.0
+
+
+def _flow_west_pct(flow_df):
+    df = flow_df[flow_df["status"].isin(["completed", "Finished"])].copy()
+    if df.empty:
+        return 0.0
+    coords = df["pickup_lat_long"].apply(parse_dms)
+    lons = pd.Series([c[1] for c in coords]).dropna()
+    return (lons < _WEST_LON).mean() * 100 if len(lons) else 0.0
+
+
+def _compute_gaps(df):
+    if df.empty:
+        return pd.Series(dtype=float)
+    df = df.copy()
+    df["pickedup_trip_datetime"] = pd.to_datetime(df["pickedup_trip_datetime"])
+    df["dropoff_trip_datetime"]  = pd.to_datetime(df["dropoff_trip_datetime"])
+    df = df.sort_values(["dim_driver_id", "pickedup_trip_datetime"])
+    df["prev_drop"] = df.groupby("dim_driver_id")["dropoff_trip_datetime"].shift(1)
+    gaps = (df["pickedup_trip_datetime"] - df["prev_drop"]).dt.total_seconds().div(60).clip(lower=0)
+    return gaps.dropna()
+
+
+def _gap_buckets(s):
+    s = s[s > 0]
+    if len(s) == 0:
+        return {"<25m": 0, "25-75m": 0, ">75m": 0, "median": 0}
+    return {
+        "<25m":   (s < 25).mean() * 100,
+        "25-75m": ((s >= 25) & (s <= 75)).mean() * 100,
+        ">75m":   (s > 75).mean() * 100,
+        "median": s.median(),
+    }
+
+
+def _ew_parse_and_flag(flow_df):
+    df = flow_df[flow_df["status"].isin(["completed", "Finished"])].copy()
+    if df.empty:
+        return df
+    coords = df["pickup_lat_long"].apply(parse_dms)
+    df["_plon"] = [c[1] for c in coords]
+    df = df.dropna(subset=["_plon"])
+    df["is_west"] = df["_plon"] < _WEST_LON
+    return df
+
+
+def _ping_stats(acc_df, dec_df, n_drivers):
+    _driver_days = max(n_drivers * 14, 1)
+    n_acc   = len(acc_df)
+    n_dec   = len(dec_df) if not dec_df.empty else 0
+    n_total = n_acc + n_dec
+
+    lons = []
+    if not acc_df.empty and "pickup_lat_long" in acc_df.columns:
+        c = acc_df["pickup_lat_long"].apply(parse_dms)
+        lons += [x[1] for x in c if x[1] is not None]
+    if not dec_df.empty and "pickup_lat_long" in dec_df.columns:
+        c = dec_df["pickup_lat_long"].apply(parse_dms)
+        lons += [x[1] for x in c if x[1] is not None]
+    lons_s = pd.Series(lons).dropna()
+    west_pct = round((lons_s < _WEST_LON).mean() * 100, 1) if len(lons_s) else 0
+
+    if not dec_df.empty and "trip_price_in_pound" in dec_df.columns:
+        fares = dec_df["trip_price_in_pound"].dropna()
+        fares = fares[fares > 0]
+        dec_avg  = round(fares.mean(), 2) if len(fares) else 0
+        dec_sub10 = round((fares < 10).mean() * 100, 1) if len(fares) else 0
+        dec_30p   = round((fares >= 30).mean() * 100, 1) if len(fares) else 0
+    else:
+        dec_avg = dec_sub10 = dec_30p = 0
+
+    return {
+        "n_total": n_total, "n_acc": n_acc, "n_dec": n_dec,
+        "pings_per_dd": round(n_total / _driver_days, 1),
+        "acc_per_dd":   round(n_acc   / _driver_days, 1),
+        "west_pings_pct": west_pct,
+        "dec_avg_fare": dec_avg, "dec_sub10_pct": dec_sub10, "dec_30p_pct": dec_30p,
+        "accept_rate": round(n_acc / max(n_total, 1) * 100, 1),
+    }
+
+
+def _scorecard(col, label, color, rph, acc, fare, sub10, west, med_gap, gap_short):
+    rows = [
+        ("RPH",             f"£{rph:.2f}/hr"),
+        ("Acceptance rate", f"{acc:.0f}%"),
+        ("Avg fare",        f"£{fare:.2f}"),
+        ("Sub-£10 trips",   f"{sub10:.0f}%"),
+        ("West positioning",f"{west:.0f}%"),
+        ("Median gap",      f"{med_gap:.0f} min"),
+        ("Gaps < 25 min",   f"{gap_short:.0f}%"),
+    ]
+    body = "".join(
+        f'<tr><td style="padding:4px 0;color:#94a3b8;font-size:12px;">{k}</td>'
+        f'<td style="text-align:right;font-weight:bold;color:#f8fafc;font-size:13px;">{v}</td></tr>'
+        for k, v in rows
+    )
+    col.markdown(
+        f'<div style="background:#1e1e2e;border:2px solid {color};border-radius:8px;padding:16px 18px;">'
+        f'<div style="color:{color};font-size:11px;font-weight:bold;letter-spacing:1px;margin-bottom:6px;">{label}</div>'
+        f'<table style="width:100%;border-collapse:collapse;">{body}</table>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🚖 Driver Analysis")
-    st.caption("Top 10 Performers · 21+ £/hr")
+    st.caption("Odysse Fleet Intelligence")
     st.divider()
     page = st.radio("View", [
-        "Patterns Summary",
-        "Good vs Bad",
+        "Final Findings",
         "Fleet Map",
         "Driver Day",
         "Gap Analysis",
-        "Trip Flow",
-        "Zone 1 Selectivity",
-        "Zone 1: The Why",
-        "Trip Strategy DNA",
-        "Airport Run Model",
-        "Zone 3 Deep Dive",
-        "Overview",
-        "Map View",
-        "Time Patterns",
-        "Daily Trends",
-        "Trip Economics",
         "Zone Analysis",
-        "Day Patterns",
-        "Shift Behaviour",
     ])
-    st.divider()
-    all_names = list(DRIVER_NAMES.values())
-    selected_names = st.multiselect("Filter drivers", all_names, default=all_names)
-    selected_ids = [k for k, v in DRIVER_NAMES.items() if v in selected_names]
 
-# ── Data ─────────────────────────────────────────────────────────────────────
-if page != "Patterns Summary":
-    with st.spinner("Loading data..."):
-        overview_df = db.load_overview()
-        overview_df["display_name"] = overview_df["dim_driver_id"].map(DRIVER_NAMES).fillna(overview_df["driver_name"])
-    overview_filtered = overview_df[overview_df["dim_driver_id"].isin(selected_ids)]
-
-# ── Patterns Summary ─────────────────────────────────────────────────────────
-if page == "Patterns Summary":
-    st.title("Patterns Summary")
-    st.caption("What the data actually says about how these 10 drivers earn more.")
-
-    # ── Load all data needed
-    with st.spinner("Running analysis..."):
-        perf_df = db.load_overview()
-        perf_df["display_name"] = perf_df["dim_driver_id"].map(DRIVER_NAMES).fillna(perf_df["driver_name"])
-
-        raw_z = db.load_zone_trips()
-        raw_z["display_name"] = raw_z["dim_driver_id"].map(DRIVER_NAMES).fillna(raw_z["driver_full_name"])
-        zone_df2 = enrich_zones(raw_z)
-        zone_df2 = calc_true_rph(zone_df2)
-        zone_df2 = zone_df2[zone_df2["dim_driver_id"].isin(selected_ids)].copy()
-        zone_df2["pickup_zone"] = zone_df2["pickup_zone"].astype(int)
-        zone_df2["dropoff_zone"] = zone_df2["dropoff_zone"].astype(int)
-
-        hourly_df = db.load_hourly_trips()
-        hourly_df = hourly_df[hourly_df["dim_driver_id"].isin(selected_ids)]
-
-    # Fleet baseline (hardcoded from run_analysis.py output)
-    FLEET_RPH    = 23.04
-    FLEET_UTIL   = 68.2
-    FLEET_ACCEPT = 57.2
-
-    top10_rph    = perf_df["rph"].mean()
-    top10_util   = perf_df["avg_util"].mean()
-    top10_accept = perf_df["avg_acceptance"].mean()
-
-    # ── SECTION 1: The big picture
-    st.subheader("1 — How much better are they, really?")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Top 10 avg RPH",    f"£{top10_rph:.2f}/hr",  f"+£{top10_rph-FLEET_RPH:.2f} vs fleet")
-    c2.metric("Utilisation",        f"{top10_util:.1f}%",     f"+{top10_util-FLEET_UTIL:.1f}% vs fleet")
-    c3.metric("Acceptance rate",    f"{top10_accept:.1f}%",   f"{top10_accept-FLEET_ACCEPT:.1f}% vs fleet", delta_color="inverse")
-    c4.metric("Bolt acceptance",    "~37%",                   "Declining 63% of Bolt pings")
-
-    st.info("📌 **Lower acceptance rate, higher earnings.** These drivers decline more trips than average — they are not grabbing everything they're sent.")
-
-    st.divider()
-
-    # ── SECTION 2: Zone efficiency
-    st.subheader("2 — Zone 1 earns nearly double Zone 3 per real hour")
-
-    zone_eff = zone_df2.groupby("pickup_zone").agg(
-        trips=("trip_price_in_pound", "count"),
-        avg_fare=("trip_price_in_pound", "mean"),
-        avg_wait=("gap_mins", "mean"),
-        avg_ride=("pob_duration_in_min", "mean"),
-        true_rph=("true_rph", "mean"),
-        avg_dropoff=("dropoff_zone", "mean"),
-    ).round(1).reset_index()
-    zone_eff["zone_label"] = "Zone " + zone_eff["pickup_zone"].astype(str)
-
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        fig_z = px.bar(
-            zone_eff.sort_values("pickup_zone"),
-            x="zone_label", y="true_rph",
-            color="true_rph", color_continuous_scale="RdYlGn",
-            text="true_rph",
-            labels={"zone_label": "Pickup Zone", "true_rph": "True RPH £"},
-        )
-        fig_z.update_traces(texttemplate="£%{text:.0f}", textposition="outside")
-        fig_z.update_layout(coloraxis_showscale=False, height=320,
-                            title="True RPH by Pickup Zone (incl. wait time)")
-        st.plotly_chart(fig_z, use_container_width=True)
-
-    with col_b:
-        fig_w = px.bar(
-            zone_eff.sort_values("pickup_zone"),
-            x="zone_label", y="avg_wait",
-            color="avg_wait", color_continuous_scale="RdYlGn_r",
-            text="avg_wait",
-            labels={"zone_label": "Pickup Zone", "avg_wait": "Avg Wait (mins)"},
-        )
-        fig_w.update_traces(texttemplate="%{text:.0f} min", textposition="outside")
-        fig_w.update_layout(coloraxis_showscale=False, height=320,
-                            title="Avg Wait Time by Pickup Zone")
-        st.plotly_chart(fig_w, use_container_width=True)
-
-    st.info("📌 **Zone 3 is the trap.** It has the highest average wait (32 min mean) and lowest full-cycle True RPH (~£17/hr). Zone 1 is strongest at ~£21/hr full-cycle. Zone 6 is best at ~£23/hr but trips are long — they drop passengers far from the city. (True RPH = fare ÷ (inter-trip gap + pickup time + ride time).)")
-
-    # Zone dropoff table
-    st.markdown("**Where do pickups in each zone actually drop off?**")
-    dropoff_tbl = zone_eff[["zone_label", "trips", "avg_fare", "avg_wait", "avg_ride", "true_rph", "avg_dropoff"]].copy()
-    dropoff_tbl.columns = ["Pickup Zone", "Trips", "Avg Fare £", "Avg Wait min", "Avg Ride min", "True RPH £", "Avg Dropoff Zone"]
-    dropoff_tbl["Avg Dropoff Zone"] = dropoff_tbl["Avg Dropoff Zone"].apply(lambda x: f"Zone {x:.1f}")
-    st.dataframe(dropoff_tbl, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # ── SECTION 3: Acceptance patterns
-    st.subheader("3 — They decline Zone 1 trips more than any other zone")
-
-    accept_zone_data = pd.DataFrame({
-        "Zone":     ["Zone 1", "Zone 2", "Zone 3", "Zone 4", "Zone 5", "Zone 6"],
-        "Accepted": [27.8, 26.6, 24.3, 10.1, 5.6, 5.6],
-        "Declined": [34.9, 28.2, 23.1,  7.7, 3.3, 2.8],
-    })
-    accept_melt = accept_zone_data.melt(id_vars="Zone", var_name="Outcome", value_name="% of trips")
-    fig_acc = px.bar(
-        accept_melt, x="Zone", y="% of trips", color="Outcome",
-        barmode="group",
-        color_discrete_map={"Accepted": "#22c55e", "Declined": "#ef4444"},
-        labels={"Zone": "Pickup Zone"},
-        title="% of Accepted vs Declined trips by pickup zone (Bolt only)",
-    )
-    fig_acc.update_layout(height=360)
-    st.plotly_chart(fig_acc, use_container_width=True)
-
-    st.info("📌 **Zone 1 selectivity is the pattern.** Drivers receive more Zone 1 pings proportionally than any other zone — and decline the highest share of them. They're not taking every Zone 1 trip; they're waiting for the ones worth it (longer distance, off-peak timing, higher fare).")
-
-    # Per-driver acceptance
-    accept_driver = pd.DataFrame([
-        {"Driver": "Monier Janabi",         "Accept%": 11, "Most Declined": "Zone 3", "Most Accepted": "Zone 3"},
-        {"Driver": "Marius Norvaisas",       "Accept%": 88, "Most Declined": "Zone 2", "Most Accepted": "Zone 3"},
-        {"Driver": "Ertac Cindogulu",        "Accept%": 19, "Most Declined": "Zone 1", "Most Accepted": "Zone 1"},
-        {"Driver": "Bal Jamts",              "Accept%": 33, "Most Declined": "Zone 1", "Most Accepted": "Zone 1"},
-        {"Driver": "Abdi Saeed Mohamed",     "Accept%": 51, "Most Declined": "Zone 2", "Most Accepted": "Zone 2"},
-        {"Driver": "Anish Chaudhry",         "Accept%": 54, "Most Declined": "Zone 1", "Most Accepted": "Zone 2"},
-        {"Driver": "MHD Amir Aljaghsi",      "Accept%": 77, "Most Declined": "Zone 3", "Most Accepted": "Zone 4"},
-        {"Driver": "Jermaine Asante Gyamfi", "Accept%": 52, "Most Declined": "Zone 3", "Most Accepted": "Zone 3"},
-        {"Driver": "Mohamed Warsame Nur",    "Accept%": 39, "Most Declined": "Zone 2", "Most Accepted": "Zone 2"},
-        {"Driver": "Brijenkumar Patel",      "Accept%": 59, "Most Declined": "Zone 3", "Most Accepted": "Zone 3"},
-    ])
-    accept_driver = accept_driver[accept_driver["Driver"].isin(selected_names)]
-
-    fig_ad = px.bar(
-        accept_driver.sort_values("Accept%"),
-        x="Accept%", y="Driver", orientation="h",
-        color="Accept%", color_continuous_scale="RdYlGn",
-        text="Accept%",
-        title="Bolt Acceptance Rate per Driver (%)",
-        labels={"Accept%": "Acceptance %", "Driver": ""},
-    )
-    fig_ad.update_traces(texttemplate="%{text}%", textposition="outside")
-    fig_ad.update_layout(coloraxis_showscale=False, height=380)
-    st.plotly_chart(fig_ad, use_container_width=True)
-
-    st.divider()
-
-    # ── SECTION 4: When they work
-    st.subheader("4 — They work different shifts but all avoid the Zone 3 dead zone")
-
-    shift_data = pd.DataFrame([
-        {"Driver": "Marius Norvaisas",       "Start": 4,  "End": 18, "Peak Hour": "04:00", "Avg Peak Fare": 18.90},
-        {"Driver": "Abdi Saeed Mohamed",     "Start": 6,  "End": 15, "Peak Hour": "07:00", "Avg Peak Fare": 22.40},
-        {"Driver": "Mohamed Warsame Nur",    "Start": 7,  "End": 16, "Peak Hour": "09:00", "Avg Peak Fare": 12.07},
-        {"Driver": "Anish Chaudhry",         "Start": 7,  "End": 20, "Peak Hour": "10:00", "Avg Peak Fare": 13.84},
-        {"Driver": "Bal Jamts",              "Start": 9,  "End": 18, "Peak Hour": "11:00", "Avg Peak Fare": 12.90},
-        {"Driver": "Ertac Cindogulu",        "Start": 9,  "End": 16, "Peak Hour": "13:00", "Avg Peak Fare": 16.15},
-        {"Driver": "Brijenkumar Patel",      "Start": 8,  "End": 19, "Peak Hour": "15:00", "Avg Peak Fare": 12.72},
-        {"Driver": "Monier Janabi",          "Start": 8,  "End": 17, "Peak Hour": "18:00", "Avg Peak Fare": 20.11},
-        {"Driver": "Jermaine Asante Gyamfi", "Start": 10, "End": 20, "Peak Hour": "18:00", "Avg Peak Fare": 13.07},
-        {"Driver": "MHD Amir Aljaghsi",      "Start": 8,  "End": 22, "Peak Hour": "21:00", "Avg Peak Fare": 12.98},
-    ])
-    shift_data = shift_data[shift_data["Driver"].isin(selected_names)]
-
-    fig_sh = px.timeline(
-        shift_data.assign(
-            Start_dt=pd.to_datetime("2024-01-01") + pd.to_timedelta(shift_data["Start"], unit="h"),
-            End_dt=pd.to_datetime("2024-01-01")   + pd.to_timedelta(shift_data["End"],   unit="h"),
-        ),
-        x_start="Start_dt", x_end="End_dt", y="Driver",
-        color="Avg Peak Fare", color_continuous_scale="YlOrRd",
-        title="Typical Shift Window per Driver (coloured by peak-hour fare)",
-        labels={"Avg Peak Fare": "Peak Fare £"},
-    )
-    fig_sh.update_xaxes(tickformat="%H:%M")
-    fig_sh.update_layout(height=380, coloraxis_colorbar_title="Peak Fare £")
-    st.plotly_chart(fig_sh, use_container_width=True)
-
-    st.info("📌 **Three distinct shift profiles emerge:**\n"
-            "- **Early birds (4–6am start):** Marius, Abdi — catch airport runs and night-shift end fares (highest peak fares)\n"
-            "- **Day shift (9am–4pm):** Bal Jamts, Ertac, Mohamed Warsame — high volume, moderate fares\n"
-            "- **Evening peak hunters (finish 8–10pm):** Monier, Jermaine, MHD — targeting 6–9pm surge")
-
-    st.divider()
-
-    # ── SECTION 5: Platform
-    st.subheader("5 — 8 of 10 are Bolt-primary")
-    plat_data = pd.DataFrame([
-        {"Driver": "Marius Norvaisas",       "Uber": 64, "Bolt": 36},
-        {"Driver": "Jermaine Asante Gyamfi", "Uber": 55, "Bolt": 45},
-        {"Driver": "Bal Jamts",              "Uber": 18, "Bolt": 82},
-        {"Driver": "Ertac Cindogulu",        "Uber":  5, "Bolt": 95},
-        {"Driver": "Monier Janabi",          "Uber":  0, "Bolt": 100},
-        {"Driver": "Abdi Saeed Mohamed",     "Uber":  0, "Bolt": 100},
-        {"Driver": "Anish Chaudhry",         "Uber":  0, "Bolt": 100},
-        {"Driver": "MHD Amir Aljaghsi",      "Uber":  0, "Bolt": 100},
-        {"Driver": "Mohamed Warsame Nur",    "Uber":  0, "Bolt": 100},
-        {"Driver": "Brijenkumar Patel",      "Uber":  0, "Bolt": 100},
-    ])
-    plat_data = plat_data[plat_data["Driver"].isin(selected_names)]
-    plat_melt = plat_data.melt(id_vars="Driver", var_name="Platform", value_name="% of Trips")
-    fig_p = px.bar(plat_melt, x="% of Trips", y="Driver", color="Platform", barmode="stack",
-                   orientation="h",
-                   color_discrete_map={"Uber": "#000000", "Bolt": "#34d399"},
-                   labels={"Driver": ""})
-    fig_p.update_layout(height=360, legend=dict(orientation="h"))
-    st.plotly_chart(fig_p, use_container_width=True)
-
-    st.info("📌 **Bolt-first strategy.** The two drivers with the most Uber trips (Marius 64%, Jermaine 55%) also have the longest trip histories and operate across more zones. The pure-Bolt drivers tend to be more zone-concentrated.")
-
-    st.divider()
-
-    # ── SECTION 6: Trip flow insight
-    st.subheader("6 — What makes a 'better' trip? (Bolt shows estimated fare + distance — drivers filter on both)")
-
-    if os.path.exists(_FLOW_PATH):
-        flow_sum = pd.read_parquet(_FLOW_PATH)
-        flow_sum = flow_sum[flow_sum["dim_driver_id"].isin(selected_ids)]
-        acc_s = flow_sum[flow_sum["outcome"]=="Accepted"]
-        dec_s = flow_sum[flow_sum["outcome"]=="Declined"]
-
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            def make_flow_mini(df, title, colour):
-                pivot = df.groupby(["pickup_zone","dropoff_zone"]).size().unstack(fill_value=0)
-                pivot.index   = [f"P Z{z}" for z in pivot.index]
-                pivot.columns = [f"D Z{z}" for z in pivot.columns]
-                pct = (pivot.div(pivot.values.sum()) * 100).round(1)
-                fig = px.imshow(pct, text_auto=".0f", color_continuous_scale=colour,
-                                labels={"x":"Dropoff","y":"Pickup","color":"%"},
-                                title=title, aspect="auto")
-                fig.update_layout(height=320, coloraxis_showscale=False,
-                                  margin=dict(l=10,r=10,t=40,b=10))
-                return fig
-            st.plotly_chart(make_flow_mini(acc_s, "Accepted routes (% of total)", "Greens"),
-                            use_container_width=True)
-        with col_f2:
-            st.plotly_chart(make_flow_mini(dec_s, "Declined routes (% of total)", "Reds"),
-                            use_container_width=True)
-
-        acc_z1do = acc_s["dropoff_zone"].eq(1).mean()*100
-        dec_z1do = dec_s["dropoff_zone"].eq(1).mean()*100
-        acc_z56do = acc_s["dropoff_zone"].ge(5).mean()*100
-        dec_z56do = dec_s["dropoff_zone"].ge(5).mean()*100
-        st.info(f"📌 Declined trips go TO Zone 1 more ({dec_z1do:.0f}% of declines vs {acc_z1do:.0f}% of accepts) — "
-                f"drivers are turning down short intra-city hops.\n\n"
-                f"📌 Accepted trips go to Zone 5-6 more ({acc_z56do:.0f}% of accepts vs {dec_z56do:.0f}% of declines) — "
-                f"they favour longer runs to airports and outer zones.\n\n"
-                f"**A 'better' trip = longer destination, preferably Zone 2–4 dropoff, not a Zone 1 local hop.**")
-    else:
-        st.warning("Run `python build_flow.py` to enable trip flow analysis.")
-
-    st.divider()
-
-    # ── SECTION 7: Zone 3 nuance
-    st.subheader("7 — Zone 3 isn't always a dead zone")
-    z3_summary = pd.DataFrame([
-        {"Period": "Night (00–06)",    "Raw RPH": 36, "Verdict": "✅ Worth it"},
-        {"Period": "Morning (06–09)",  "Raw RPH": 34, "Verdict": "✅ Worth it"},
-        {"Period": "Day (09–17)",      "Raw RPH": 27, "Verdict": "❌ Avoid"},
-        {"Period": "Evening (17–23)",  "Raw RPH": 29, "Verdict": "⚠️  Borderline"},
-    ])
-    fig_z3s = px.bar(z3_summary, x="Period", y="Raw RPH", color="Verdict",
-                     color_discrete_map={"✅ Worth it":"#22c55e","❌ Avoid":"#ef4444","⚠️  Borderline":"#f59e0b"},
-                     text="Raw RPH",
-                     labels={"Raw RPH":"Raw RPH £/hr"},
-                     title="Zone 3 Raw RPH by time period (no wait time included)")
-    fig_z3s.add_hline(y=21, line_dash="dash", line_color="#3b82f6",
-                      annotation_text="Zone 1 avg £21/hr", annotation_position="top right")
-    fig_z3s.update_traces(texttemplate="£%{text}", textposition="outside")
-    fig_z3s.update_layout(height=360, coloraxis_showscale=False,
-                          legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    st.plotly_chart(fig_z3s, use_container_width=True)
-    st.info("📌 Zone 3 at **03:00 peaks at £43/hr** — longer trips (avg 11mi) going into the city. Daytime Zone 3 (£26–28/hr + 32 min avg wait) is where it falls apart. Best Zone 3 areas: Ealing, Brent, Wandsworth. Worst: Enfield, East Ham, Walthamstow.")
-
-    st.divider()
-
-    # ── SECTION 8: Final summary table
-    st.subheader("All patterns — at a glance")
-    st.markdown("""
-| # | Pattern | Evidence | Action |
-|---|---|---|---|
-| 1 | **Zone 1 = best full-cycle RPH (~£21/hr)** | Short pickup wait (6.7 min), high ping density | Stay in Zone 1 during daytime — but be selective |
-| 2 | **Zone 3 daytime = dead zone** | £27/hr + 32 min avg wait | Leave Zone 3 before 09:00 or after 17:00 |
-| 3 | **Zone 3 night = good** | £32–43/hr, 03:00 = £43/hr peak | Zone 3 valid for night-shift drivers |
-| 4 | **Decline Zone 1 hops, wait for cross-zone trips** | 37.7% of declines go to Z1 vs 29.2% of accepts | On Bolt: check destination before accepting |
-| 5 | **Outer zone drops strand you far out** | Z5-6 pickups drop at Zone 4.5 avg | Factor in return positioning cost |
-| 6 | **Lower acceptance rate = higher RPH** | Top 10: 49% accept vs fleet 57% | Selectivity is the strategy, not volume |
-| 7 | **Three shift archetypes** | Early (4–6am), Day (9am–4pm), Evening (4–10pm) | Pick the archetype that suits the zone strategy |
-| 8 | **Bolt-primary** | 8 of 10 on Bolt (no fare visibility on ping) | Route = the only signal available for selection |
-    """)
-
-    st.divider()
-
-    # ── DOWNLOAD REPORT ──────────────────────────────────────────────────────
-    st.subheader("Download Report")
-
-    import io, datetime
-
-    def build_report():
-        lines = []
-        lines.append("TOP DRIVER PATTERN ANALYSIS REPORT")
-        lines.append(f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}")
-        lines.append(f"Drivers analysed: {', '.join(selected_names)}")
-        lines.append("=" * 70)
-
-        lines.append("\n1. PERFORMANCE VS FLEET")
-        lines.append(f"   Fleet avg RPH:          £{FLEET_RPH}/hr")
-        lines.append(f"   Top 10 avg RPH:         £{top10_rph:.2f}/hr  (+£{top10_rph-FLEET_RPH:.2f})")
-        lines.append(f"   Fleet utilisation:      {FLEET_UTIL}%")
-        lines.append(f"   Top 10 utilisation:     {top10_util:.1f}%  (+{top10_util-FLEET_UTIL:.1f}%)")
-        lines.append(f"   Fleet accept rate:      {FLEET_ACCEPT}%")
-        lines.append(f"   Top 10 accept rate:     {top10_accept:.1f}%  ({top10_accept-FLEET_ACCEPT:+.1f}%)")
-
-        lines.append("\n2. ZONE EFFICIENCY (True RPH incl. wait time)")
-        for _, row in zone_eff.iterrows():
-            lines.append(f"   Zone {int(row.pickup_zone)}: £{row.true_rph:.0f}/hr  |  avg fare £{row.avg_fare:.2f}  |  avg wait {row.avg_wait:.0f}min  |  avg dropoff Z{row.avg_dropoff:.1f}")
-
-        lines.append("\n3. TRIP FLOW (Bolt — route-based decision making)")
-        if os.path.exists(_FLOW_PATH):
-            lines.append(f"   Accepted trips to Zone 1 dropoff: {acc_z1do:.0f}%")
-            lines.append(f"   Declined trips to Zone 1 dropoff: {dec_z1do:.0f}%")
-            lines.append(f"   Accepted trips to Zone 5-6 dropoff: {acc_z56do:.0f}%")
-            lines.append(f"   Declined trips to Zone 5-6 dropoff: {dec_z56do:.0f}%")
-
-        lines.append("\n4. ZONE 3 BREAKDOWN BY TIME")
-        lines.append("   Night (00-06): £36/hr avg raw RPH  — WORTH IT")
-        lines.append("   Morning (06-09): £34/hr            — WORTH IT")
-        lines.append("   Day (09-17): £27/hr + 32min wait   — AVOID")
-        lines.append("   Evening (17-23): £29/hr            — BORDERLINE")
-
-        lines.append("\n5. SHIFT PROFILES")
-        shift_profiles = [
-            ("Marius Norvaisas","04:00","18:00","04:00","£18.90"),
-            ("Abdi Saeed Mohamed","06:00","15:00","07:00","£22.40"),
-            ("Mohamed Warsame Nur","07:00","16:00","09:00","£12.07"),
-            ("Bal Jamts","09:00","18:00","11:00","£12.90"),
-            ("Ertac Cindogulu","09:00","16:00","13:00","£16.15"),
-            ("Jermaine Asante Gyamfi","10:00","20:00","18:00","£13.07"),
-            ("Monier Janabi","08:00","17:00","18:00","£20.11"),
-            ("MHD Amir Aljaghsi","08:00","22:00","21:00","£12.98"),
-        ]
-        for name, start, end, peak, fare in shift_profiles:
-            if name in selected_names:
-                lines.append(f"   {name:<28} {start}–{end}  peak {peak} @ {fare}/trip avg")
-
-        lines.append("\n6. ACCEPTANCE RATES (Bolt only)")
-        accept_rates = [
-            ("Monier Janabi",11,"Zone 3","Zone 3"),("Marius Norvaisas",88,"Zone 2","Zone 3"),
-            ("Ertac Cindogulu",19,"Zone 1","Zone 1"),("Bal Jamts",33,"Zone 1","Zone 1"),
-            ("Abdi Saeed Mohamed",51,"Zone 2","Zone 2"),("Anish Chaudhry",54,"Zone 1","Zone 2"),
-            ("MHD Amir Aljaghsi",77,"Zone 3","Zone 4"),("Jermaine Asante Gyamfi",52,"Zone 3","Zone 3"),
-            ("Mohamed Warsame Nur",39,"Zone 2","Zone 2"),("Brijenkumar Patel",59,"Zone 3","Zone 3"),
-        ]
-        for name, rate, declined_z, accepted_z in accept_rates:
-            if name in selected_names:
-                lines.append(f"   {name:<28} {rate}% accept  most declined: {declined_z}  most accepted: {accepted_z}")
-
-        lines.append("\n7. KEY RECOMMENDATIONS")
-        lines.append("   - Stay in Zone 1 during 09:00-17:00 — best full-cycle RPH (~£21/hr), be selective on accepts")
-        lines.append("   - Avoid Zone 3 09:00-17:00 — low fares + 32 min avg wait")
-        lines.append("   - Zone 3 is viable 00:00-06:00 (£36-43/hr, long trips into city)")
-        lines.append("   - On Bolt: check destination before accepting — decline short Zone 1 hops")
-        lines.append("   - Zone 5-6 trips leave you far from city — factor in return cost")
-        lines.append("   - Target 70%+ utilisation and be selective, not high-volume")
-
-        lines.append("\n" + "=" * 70)
-        lines.append("Generated by Top Driver Analysis Dashboard")
-        return "\n".join(lines)
-
-    report_text = build_report()
-    st.download_button(
-        label="⬇ Download Report (.txt)",
-        data=report_text.encode("utf-8"),
-        file_name=f"driver_patterns_{datetime.datetime.now().strftime('%Y%m%d')}.txt",
-        mime="text/plain",
-    )
-
-    # CSV download of per-driver stats
-    driver_stats_csv = overview_filtered[["display_name","active_days","total_rides",
-                                           "total_online_hrs","rph","avg_util",
-                                           "avg_rating","avg_acceptance","total_revenue"]].copy()
-    driver_stats_csv.columns = ["Driver","Active Days","Rides","Online Hrs","RPH £",
-                                 "Util %","Rating","Accept %","Total Revenue £"]
-    st.download_button(
-        label="⬇ Download Driver Stats (.csv)",
-        data=driver_stats_csv.to_csv(index=False).encode("utf-8"),
-        file_name=f"driver_stats_{datetime.datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-    )
-
-# ── Good vs Bad ──────────────────────────────────────────────────────────────
-elif page == "Good vs Bad":
-    st.title("Good vs Bad Drivers")
-    st.caption("Top 10 performers vs 5 lower-performing drivers — zone flow, fare distribution, and key metrics side by side.")
-
-    _GOOD_IDS = [i for i in DRIVER_NAMES if i not in BAD_DRIVER_IDS]
-    _BAD_IDS  = BAD_DRIVER_IDS
+# ═══════════════════════════════════════════════════════════════════════════════
+# FINAL FINDINGS
+# ═══════════════════════════════════════════════════════════════════════════════
+if page == "Final Findings":
+    st.title("Final Findings")
+    st.caption("Key conclusions from the Odysse fleet driver performance analysis · Jan–Jun 2026")
 
     with st.spinner("Loading performance data..."):
-        good_perf = db.load_comparison_performance(_GOOD_IDS)
-        bad_perf  = db.load_comparison_performance(_BAD_IDS)
+        _ff_perf     = db.load_overview()
+        _ff_perf["display_name"] = _ff_perf["dim_driver_id"].map(DRIVER_NAMES).fillna(_ff_perf["driver_name"])
+        _ff_comp     = db.load_comparison_performance(list(BAD_DRIVER_IDS))
+        _ff_baseline = db.load_fleet_baseline_excluding(list(TOP_DRIVER_IDS) + list(BAD_DRIVER_IDS))
 
-    with st.spinner("Loading trip flow data..."):
-        good_flow_raw = db.load_comparison_flow(_GOOD_IDS)
-        bad_flow_raw  = db.load_comparison_flow(_BAD_IDS)
+    _ff_top10_rph    = _ff_perf["rph"].mean()
+    _ff_top10_accept = _ff_perf["avg_acceptance"].mean()
+    _ff_top10_util   = _ff_perf["avg_util"].mean()
+    _ff_comp_rph     = _ff_comp["rph"].mean()
+    _ff_comp_accept  = _ff_comp["acceptance"].mean()
+    _ff_comp_util    = _ff_comp["utilisation"].mean()
 
-    # ── SECTION 1: Headline metrics ───────────────────────────────────────────
-    st.subheader("1 — Headline numbers")
+    if not _ff_baseline.empty and _ff_baseline.iloc[0]["fleet_rph"] is not None:
+        _FLEET_RPH    = float(_ff_baseline.iloc[0]["fleet_rph"])
+        _FLEET_UTIL   = float(_ff_baseline.iloc[0]["fleet_util"])
+        _FLEET_ACCEPT = float(_ff_baseline.iloc[0]["fleet_accept"])
+    else:
+        _FLEET_RPH, _FLEET_UTIL, _FLEET_ACCEPT = _FLEET_RPH_DEFAULT, _FLEET_UTIL_DEFAULT, _FLEET_ACCEPT_DEFAULT
 
-    def _group_avg(perf_df):
-        return {
-            "RPH":         perf_df["rph"].mean(),
-            "Acceptance %":perf_df["acceptance"].mean(),
-            "Avg fare £":  perf_df["avg_fare"].mean(),
-            "Utilisation %": perf_df["utilisation"].mean(),
-            "Total rides": perf_df["total_rides"].sum(),
-        }
+    _fleet_driver_count = int(_ff_baseline.iloc[0]["driver_count"]) if not _ff_baseline.empty else 0
 
-    ga = _group_avg(good_perf)
-    ba = _group_avg(bad_perf)
-
-    col_g, col_b = st.columns(2)
-    with col_g:
-        st.markdown("### ✅ Top 10 drivers")
-        st.metric("RPH",           f"£{ga['RPH']:.2f}/hr")
-        st.metric("Acceptance",    f"{ga['Acceptance %']:.1f}%")
-        st.metric("Avg fare",      f"£{ga['Avg fare £']:.2f}")
-        st.metric("Utilisation",   f"{ga['Utilisation %']:.1f}%")
-        st.metric("Total rides",   f"{int(ga['Total rides']):,}")
-    with col_b:
-        st.markdown("### ⚠️ Comparison drivers")
-        st.metric("RPH",           f"£{ba['RPH']:.2f}/hr",
-                  delta=f"£{ba['RPH']-ga['RPH']:.2f} vs top 10")
-        st.metric("Acceptance",    f"{ba['Acceptance %']:.1f}%",
-                  delta=f"{ba['Acceptance %']-ga['Acceptance %']:+.1f}%")
-        st.metric("Avg fare",      f"£{ba['Avg fare £']:.2f}",
-                  delta=f"£{ba['Avg fare £']-ga['Avg fare £']:.2f}")
-        st.metric("Utilisation",   f"{ba['Utilisation %']:.1f}%",
-                  delta=f"{ba['Utilisation %']-ga['Utilisation %']:+.1f}%")
-        st.metric("Total rides",   f"{int(ba['Total rides']):,}")
-
-    # Per-driver breakdown table
-    with st.expander("Per-driver breakdown"):
-        good_perf["Group"] = "Top 10"
-        bad_perf["Group"]  = "Comparison"
-        combined = pd.concat([good_perf, bad_perf], ignore_index=True)
-        combined["driver_name"] = combined["dim_driver_id"].map(DRIVER_NAMES).fillna(combined["driver_name"])
-        st.dataframe(
-            combined[["Group","driver_name","rph","acceptance","avg_fare","utilisation","total_rides"]]
-            .rename(columns={"driver_name":"Driver","rph":"RPH £/hr","acceptance":"Accept %",
-                              "avg_fare":"Avg fare £","utilisation":"Util %","total_rides":"Rides"})
-            .sort_values("RPH £/hr", ascending=False),
-            use_container_width=True, hide_index=True
-        )
-
-    # ── SECTION 2: Zone flow heatmaps ─────────────────────────────────────────
-    st.divider()
-    st.subheader("2 — Where they go: zone flow heatmap")
-    st.caption("Pickup zone (rows) × Dropoff zone (cols) — cell = % of accepted trips. "
-               "Brighter = more trips on that route.")
-
-    def _build_zone_matrix(flow_raw):
-        df = enrich_zones(flow_raw[flow_raw["status"].isin(["completed","Finished"])].copy())
-        df = df.dropna(subset=["pickup_zone","dropoff_zone"])
-        df["pickup_zone"]  = df["pickup_zone"].astype(int)
-        df["dropoff_zone"] = df["dropoff_zone"].astype(int)
-        mat = (df.groupby(["pickup_zone","dropoff_zone"])
-                 .size().reset_index(name="trips"))
-        total = mat["trips"].sum()
-        mat["pct"] = (mat["trips"] / total * 100).round(1)
-        pivot = mat.pivot(index="pickup_zone", columns="dropoff_zone", values="pct").fillna(0)
-        # Ensure zones 1-6 on both axes
-        for z in range(1, 7):
-            if z not in pivot.index:   pivot.loc[z] = 0
-            if z not in pivot.columns: pivot[z]     = 0
-        return pivot.sort_index()[sorted(pivot.columns)]
-
-    with st.spinner("Enriching zone data (this takes a moment)..."):
-        good_mat = _build_zone_matrix(good_flow_raw)
-        bad_mat  = _build_zone_matrix(bad_flow_raw)
-
-    col_h1, col_h2 = st.columns(2)
-    with col_h1:
-        fig_g = px.imshow(
-            good_mat, text_auto=".1f",
-            color_continuous_scale="Blues",
-            labels=dict(x="Dropoff zone", y="Pickup zone", color="% of trips"),
-            title="Top 10 — accepted trip zone flow (%)",
-            aspect="equal",
-        )
-        fig_g.update_layout(height=380)
-        st.plotly_chart(fig_g, use_container_width=True)
-
-    with col_h2:
-        fig_b = px.imshow(
-            bad_mat, text_auto=".1f",
-            color_continuous_scale="Reds",
-            labels=dict(x="Dropoff zone", y="Pickup zone", color="% of trips"),
-            title="Comparison drivers — accepted trip zone flow (%)",
-            aspect="equal",
-        )
-        fig_b.update_layout(height=380)
-        st.plotly_chart(fig_b, use_container_width=True)
-
-    # Difference heatmap
-    st.markdown("**Difference map** — green = top 10 do this more, red = comparison drivers do this more")
-    diff_mat = good_mat.subtract(bad_mat, fill_value=0).round(1)
-    fig_diff = px.imshow(
-        diff_mat, text_auto=".1f",
-        color_continuous_scale="RdYlGn",
-        color_continuous_midpoint=0,
-        labels=dict(x="Dropoff zone", y="Pickup zone", color="Δ %"),
-        title="Zone flow difference (Top 10 minus Comparison)",
-        aspect="equal",
-    )
-    fig_diff.update_layout(height=380)
-    st.plotly_chart(fig_diff, use_container_width=True)
-
-    # ── SECTION 3: Fare distribution ─────────────────────────────────────────
-    st.divider()
-    st.subheader("3 — Fare distribution: are bad drivers taking cheaper trips?")
-
-    def _accepted_fares(flow_raw):
-        return flow_raw[flow_raw["status"].isin(["completed","Finished"])]["trip_price_in_pound"].dropna()
-
-    good_fares = _accepted_fares(good_flow_raw)
-    bad_fares  = _accepted_fares(bad_flow_raw)
-
-    fare_df = pd.DataFrame({
-        "Fare £": pd.concat([good_fares, bad_fares], ignore_index=True),
-        "Group":  (["Top 10"] * len(good_fares)) + (["Comparison"] * len(bad_fares)),
-    })
-    fare_df = fare_df[fare_df["Fare £"] <= 80]   # clip outliers
-
-    fig_fare = px.histogram(
-        fare_df, x="Fare £", color="Group",
-        barmode="overlay", nbins=40, opacity=0.7,
-        color_discrete_map={"Top 10": "#22c55e", "Comparison": "#ef4444"},
-        title="Fare distribution — accepted trips",
-        labels={"Fare £": "Trip fare (£)", "count": "Number of trips"},
-    )
-    fig_fare.add_vline(x=good_fares.median(), line_dash="dash", line_color="#22c55e",
-                       annotation_text=f"Top 10 median £{good_fares.median():.2f}",
-                       annotation_position="top right")
-    fig_fare.add_vline(x=bad_fares.median(), line_dash="dash", line_color="#ef4444",
-                       annotation_text=f"Comparison median £{bad_fares.median():.2f}",
-                       annotation_position="top left")
-    fig_fare.update_layout(height=380)
-    st.plotly_chart(fig_fare, use_container_width=True)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Top 10 median fare",   f"£{good_fares.median():.2f}")
-    c2.metric("Comparison median fare",f"£{bad_fares.median():.2f}",
-              delta=f"£{bad_fares.median()-good_fares.median():.2f}")
-    sub10_good = (good_fares < 10).mean() * 100
-    sub10_bad  = (bad_fares  < 10).mean() * 100
-    c3.metric("Top 10 trips under £10",   f"{sub10_good:.1f}%")
-    c4.metric("Comparison trips under £10",f"{sub10_bad:.1f}%",
-              delta=f"{sub10_bad-sub10_good:+.1f}%")
-
-    # ── SECTION 4: Hourly activity ────────────────────────────────────────────
-    st.divider()
-    st.subheader("4 — When they work: hourly trip volume")
-    st.caption("Are bad drivers grinding the wrong hours?")
-
-    def _hourly(flow_raw):
-        df = flow_raw[flow_raw["status"].isin(["completed","Finished"])].copy()
-        df["trips_hr"] = pd.to_numeric(df["trips_hr"], errors="coerce")
-        return df.groupby("trips_hr").size().reset_index(name="trips")
-
-    good_hr = _hourly(good_flow_raw)
-    bad_hr  = _hourly(bad_flow_raw)
-    good_hr["Group"] = "Top 10"
-    bad_hr["Group"]  = "Comparison"
-    hr_df = pd.concat([good_hr, bad_hr], ignore_index=True)
-    # Normalise to % of each group's total so volume difference doesn't mislead
-    for grp in ["Top 10", "Comparison"]:
-        mask = hr_df["Group"] == grp
-        hr_df.loc[mask, "pct"] = (hr_df.loc[mask, "trips"] /
-                                   hr_df.loc[mask, "trips"].sum() * 100).round(1)
-
-    fig_hr = px.line(
-        hr_df, x="trips_hr", y="pct", color="Group",
-        color_discrete_map={"Top 10": "#22c55e", "Comparison": "#ef4444"},
-        markers=True,
-        labels={"trips_hr": "Hour of day", "pct": "% of trips"},
-        title="Trip volume by hour — normalised (% of each group's total)",
-    )
-    fig_hr.update_layout(height=340, xaxis=dict(dtick=1))
-    st.plotly_chart(fig_hr, use_container_width=True)
-
-    # ── SECTION 5: Zone 3 trap ───────────────────────────────────────────────
-    st.divider()
-    st.subheader("5 — The Zone 3 trap")
-    st.caption("Zone 3 has the worst daytime RPH in our data (~£18–22/hr full-cycle). "
-               "Are comparison drivers stuck there while top 10 drivers stay in Zone 1/2?")
-
-    def _z3_stats(mat):
-        z3_pickup  = mat.loc[3].sum()  if 3 in mat.index   else 0
-        z3_dropoff = mat[3].sum()      if 3 in mat.columns else 0
-        z3_chain   = mat.loc[3, 3]     if (3 in mat.index and 3 in mat.columns) else 0
-        z1_pickup  = mat.loc[1].sum()  if 1 in mat.index   else 0
-        z1_chain   = mat.loc[1, 1]     if (1 in mat.index and 1 in mat.columns) else 0
-        return z3_pickup, z3_dropoff, z3_chain, z1_pickup, z1_chain
-
-    g_z3p, g_z3d, g_z3c, g_z1p, g_z1c = _z3_stats(good_mat)
-    b_z3p, b_z3d, b_z3c, b_z1p, b_z1c = _z3_stats(bad_mat)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("**Zone 1 pickups (% of all trips)**")
-        st.metric("Top 10",      f"{g_z1p:.1f}%")
-        st.metric("Comparison",  f"{b_z1p:.1f}%", delta=f"{b_z1p - g_z1p:+.1f}%")
-    with col2:
-        st.markdown("**Zone 3 pickups (% of all trips)**")
-        st.metric("Top 10",      f"{g_z3p:.1f}%")
-        st.metric("Comparison",  f"{b_z3p:.1f}%", delta=f"{b_z3p - g_z3p:+.1f}%")
-    with col3:
-        st.markdown("**Zone 3→Zone 3 trips (stuck chaining)**")
-        st.metric("Top 10",      f"{g_z3c:.1f}%")
-        st.metric("Comparison",  f"{b_z3c:.1f}%", delta=f"{b_z3c - g_z3c:+.1f}%")
-
-    # Zone 1 vs Zone 3 bar comparison
-    zone_cmp = pd.DataFrame([
-        {"Zone": "Z1 pickup",   "Top 10": g_z1p, "Comparison": b_z1p},
-        {"Zone": "Z1→Z1 chain", "Top 10": g_z1c, "Comparison": b_z1c},
-        {"Zone": "Z3 pickup",   "Top 10": g_z3p, "Comparison": b_z3p},
-        {"Zone": "Z3 dropoff",  "Top 10": g_z3d, "Comparison": b_z3d},
-        {"Zone": "Z3→Z3 chain", "Top 10": g_z3c, "Comparison": b_z3c},
-    ])
-    fig_z3 = px.bar(
-        zone_cmp.melt(id_vars="Zone", var_name="Group", value_name="% of trips"),
-        x="Zone", y="% of trips", color="Group", barmode="group",
-        color_discrete_map={"Top 10": "#22c55e", "Comparison": "#ef4444"},
-        title="Zone 1 vs Zone 3 activity — Top 10 vs Comparison (%)",
-        text_auto=".1f",
-    )
-    fig_z3.update_layout(height=360)
-    st.plotly_chart(fig_z3, use_container_width=True)
-
-    # Narrative
-    z3_gap = b_z3p - g_z3p
-    z1_gap = g_z1p - b_z1p
-    st.markdown(
-        f'<div style="background:#1e1e2e;border-left:4px solid #ef4444;'
-        f'padding:14px 16px;border-radius:6px;color:#e2e8f0;">'
-        f'<strong>Why Zone 3 is a problem:</strong> Zone 3 daytime full-cycle RPH is ~£18–22/hr — '
-        f'well below the fleet average of £22.9/hr. Once a driver is picking up in Zone 3, '
-        f'they tend to stay there (Z3→Z3 chaining), because the pings they receive are from '
-        f'nearby passengers also in Zone 3. It\'s a gravity well — hard to escape without '
-        f'deliberately declining Zone 3 pings and waiting for one that pulls them back toward Zone 1.<br><br>'
-        f'<strong>The numbers:</strong> Comparison drivers pick up from Zone 3 on <strong>{b_z3p:.1f}%</strong> '
-        f'of trips vs <strong>{g_z3p:.1f}%</strong> for the top 10 — a <strong>{z3_gap:+.1f}%</strong> gap. '
-        f'Simultaneously, top 10 drivers pick up from Zone 1 on <strong>{g_z1p:.1f}%</strong> of trips '
-        f'vs <strong>{b_z1p:.1f}%</strong> for comparison — a <strong>{z1_gap:.1f}%</strong> gap in the right direction. '
-        f'These two numbers together explain most of the RPH difference.'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    # How did they end up in Zone 3? — inbound flow to Z3
-    st.markdown("#### How do drivers end up in Zone 3?")
-    st.caption("These are the trips that DROP OFF in Zone 3 — this is what puts drivers there.")
-
-    def _z3_inbound(mat):
-        if 3 not in mat.columns:
-            return pd.DataFrame()
-        col = mat[3].reset_index()
-        col.columns = ["Pickup Zone", "% ending in Z3"]
-        col["Pickup Zone"] = col["Pickup Zone"].apply(lambda z: f"Z{z}")
-        return col.sort_values("% ending in Z3", ascending=False)
-
-    g_inbound = _z3_inbound(good_mat)
-    b_inbound = _z3_inbound(bad_mat)
-
-    ci1, ci2 = st.columns(2)
-    with ci1:
-        st.markdown("**Top 10 — trips that end in Zone 3**")
-        if not g_inbound.empty:
-            fig_gi = px.bar(g_inbound, x="Pickup Zone", y="% ending in Z3",
-                            color_discrete_sequence=["#22c55e"], text_auto=".1f",
-                            title="Where did they come from?")
-            fig_gi.update_layout(height=280)
-            st.plotly_chart(fig_gi, use_container_width=True)
-    with ci2:
-        st.markdown("**Comparison — trips that end in Zone 3**")
-        if not b_inbound.empty:
-            fig_bi = px.bar(b_inbound, x="Pickup Zone", y="% ending in Z3",
-                            color_discrete_sequence=["#ef4444"], text_auto=".1f",
-                            title="Where did they come from?")
-            fig_bi.update_layout(height=280)
-            st.plotly_chart(fig_bi, use_container_width=True)
-
-    # ── SECTION 6: East vs West positioning ──────────────────────────────────
-    st.divider()
-    st.subheader("6 — East vs West: where are they actually operating?")
+    # ── SECTION 1: The performance gap ───────────────────────────────────────
+    st.subheader("1 — The performance gap")
     st.caption(
-        "London's high-demand corridor runs roughly west of -0.12° longitude "
-        "(Charing Cross line) — Mayfair, Kensington, Chelsea, Knightsbridge, Notting Hill. "
-        "East of that line ping density drops sharply."
+        f"Rest of fleet ({_fleet_driver_count} drivers, excl. top 10 + comparison) "
+        f"vs top 10 performers vs 5 lowest-performing comparison drivers."
     )
 
-    # West boundary longitude (roughly Charing Cross / City of London line)
-    _WEST_LON = -0.12
+    _hc1, _hc2, _hc3 = st.columns(3)
+    with _hc1:
+        st.markdown(_stat_card_html("Rest of Fleet", _FLEET_RPH, _FLEET_ACCEPT, _FLEET_UTIL, "#94a3b8"),
+                    unsafe_allow_html=True)
+    with _hc2:
+        st.markdown(_stat_card_html(
+            "Top 10 Drivers", _ff_top10_rph, _ff_top10_accept, _ff_top10_util, "#22c55e",
+            rph_d=_ff_top10_rph - _FLEET_RPH,
+            accept_d=_ff_top10_accept - _FLEET_ACCEPT,
+            util_d=_ff_top10_util - _FLEET_UTIL,
+        ), unsafe_allow_html=True)
+    with _hc3:
+        st.markdown(_stat_card_html(
+            "Comparison Drivers", _ff_comp_rph, _ff_comp_accept, _ff_comp_util, "#ef4444",
+            rph_d=_ff_comp_rph - _FLEET_RPH,
+            accept_d=_ff_comp_accept - _FLEET_ACCEPT,
+            util_d=_ff_comp_util - _FLEET_UTIL,
+        ), unsafe_allow_html=True)
 
-    def _parse_pickup_coords(flow_raw, sample_n=800):
-        """Parse pickup lat/lon for a sampled set of accepted trips."""
-        df = flow_raw[flow_raw["status"].isin(["completed", "Finished"])].copy()
-        if len(df) > sample_n:
-            df = df.sample(sample_n, random_state=42)
-        coords = df["pickup_lat_long"].apply(parse_dms)
-        df["plat"] = [c[0] for c in coords]
-        df["plon"] = [c[1] for c in coords]
-        return df[["dim_driver_id", "plat", "plon"]].dropna()
+    st.markdown("<br>", unsafe_allow_html=True)
+    _rph_gap   = _ff_top10_rph - _ff_comp_rph
+    _daily_gap = _rph_gap * 9
+    _weekly_gap = _daily_gap * 5
+    st.info(
+        f"📌 Top 10 earn **£{_rph_gap:.2f}/hr more** than comparison drivers. "
+        f"Over a 9-hour shift that's **£{_daily_gap:.0f}/day** — roughly **£{_weekly_gap:.0f}/week** per driver."
+    )
 
-    with st.spinner("Parsing pickup coordinates..."):
-        good_c = _parse_pickup_coords(good_flow_raw)
-        bad_c  = _parse_pickup_coords(bad_flow_raw)
+    # ── SECTION 2: Selectivity beats volume ──────────────────────────────────
+    st.divider()
+    st.subheader("2 — Selectivity beats volume")
 
-    good_c["Group"] = "Top 10"
-    bad_c["Group"]  = "Comparison"
-    all_c = pd.concat([good_c, bad_c], ignore_index=True)
-    all_c = all_c[
-        all_c["plat"].between(51.3, 51.7) &
-        all_c["plon"].between(-0.55, 0.3)
+    _s2a, _s2b = st.columns([3, 2])
+    with _s2a:
+        st.markdown(
+            '<div style="background:#1e1e2e;border-left:4px solid #6366f1;padding:16px 18px;'
+            'border-radius:6px;color:#e2e8f0;">'
+            '<strong style="font-size:15px;">The counterintuitive result:</strong><br><br>'
+            'Top 10 drivers <strong>accept fewer pings</strong> than the fleet average — yet earn '
+            'significantly more per hour. On Bolt, drivers see estimated <strong>fare and destination '
+            'before accepting</strong>. The top 10 decline roughly 63% of all pings. They treat the '
+            'platform as a curated feed, not first-come-first-served. Comparison drivers do the '
+            'opposite: higher acceptance, lower RPH, more trips on the clock — and worse earnings.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    with _s2b:
+        _acc_df = pd.DataFrame({
+            "Group":    ["Fleet avg", "Top 10", "Comparison"],
+            "Accept %": [_FLEET_ACCEPT, _ff_top10_accept, _ff_comp_accept],
+        })
+        _fig_acc = px.bar(
+            _acc_df, x="Group", y="Accept %",
+            color="Group",
+            color_discrete_map={"Fleet avg": "#94a3b8", "Top 10": "#22c55e", "Comparison": "#ef4444"},
+            text="Accept %",
+            title="Acceptance rate comparison",
+            height=280,
+        )
+        _fig_acc.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        _fig_acc.update_layout(showlegend=False, yaxis_ticksuffix="%", yaxis_range=[0, 80], margin=dict(t=40, b=10))
+        st.plotly_chart(_fig_acc, use_container_width=True)
+
+    # ── SECTION 3: West positioning ───────────────────────────────────────────
+    st.divider()
+    st.subheader("3 — Where you end up matters more than where you start")
+
+    _s3a, _s3b = st.columns([2, 3])
+    with _s3a:
+        _west_outliers = pd.DataFrame([
+            {"Driver": "Plummer (Cat D)", "West %": 92.6, "Group": "Cat D"},
+            {"Driver": "Abdi (Cat A)",    "West %": 42.6, "Group": "Cat A"},
+            {"Driver": "Mukhtar (Cat A)", "West %": 33.8, "Group": "Cat A"},
+            {"Driver": "Yousuf (Cat A)",  "West %": 25.7, "Group": "Cat A"},
+        ])
+        _fig_wo = px.bar(
+            _west_outliers, x="West %", y="Driver", orientation="h",
+            color="Group",
+            color_discrete_map={"Cat A": "#22c55e", "Cat D": "#ef4444"},
+            text="West %",
+            title="West pickup % — 4 outlier drivers",
+            height=260,
+        )
+        _fig_wo.add_vline(x=50, line_dash="dash", line_color="#94a3b8",
+                          annotation_text="50%", annotation_position="top")
+        _fig_wo.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
+        _fig_wo.update_layout(xaxis_range=[0, 110], legend=dict(orientation="h", y=1.15), margin=dict(t=55, b=10))
+        st.plotly_chart(_fig_wo, use_container_width=True)
+    with _s3b:
+        st.markdown(
+            '<div style="background:#1e1e2e;border-left:4px solid #facc15;padding:16px 18px;'
+            'border-radius:6px;color:#e2e8f0;">'
+            '<strong>West positioning is useful — but not the whole story.</strong><br><br>'
+            'The west corridor (Mayfair / Kensington / Chelsea / Knightsbridge) generates higher-value '
+            'pings and more of them. A driver idle in Hackney will wait longer and earn less than one '
+            'in South Kensington — not because of decisions made during the gap, but because of '
+            '<em>where the previous trip left them</em>.<br><br>'
+            'However, four outlier drivers break the rule: <strong>three Cat A drivers operating '
+            'predominantly east, and one Cat D driver operating 93% west</strong>. West positioning '
+            'is an advantage, not a guarantee. What converts it is selectivity.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── SECTION 4: Zone 3 trap ────────────────────────────────────────────────
+    st.divider()
+    st.subheader("4 — Zone 3 daytime is a gravity well")
+
+    _s4a, _s4b = st.columns([5, 4])
+    with _s4a:
+        _zone_tbl = pd.DataFrame([
+            {"Zone": "Zone 1",             "True RPH": "~£21/hr",   "Avg wait": "6.7 min", "Verdict": "✅ Best daytime positioning"},
+            {"Zone": "Zone 2",             "True RPH": "~£19/hr",   "Avg wait": "11 min",  "Verdict": "✅ Solid"},
+            {"Zone": "Zone 3 (daytime)",   "True RPH": "~£17/hr",   "Avg wait": "32 min",  "Verdict": "❌ Avoid 09:00–17:00"},
+            {"Zone": "Zone 3 (night 00–06)","True RPH": "£32–43/hr","Avg wait": "—",       "Verdict": "✅ Valid for night shift"},
+            {"Zone": "Zone 6",             "True RPH": "~£23/hr",   "Avg wait": "15 min",  "Verdict": "⚠️ Long drop — factor return cost"},
+        ])
+        st.dataframe(_zone_tbl, use_container_width=True, hide_index=True)
+        st.caption("True RPH = fare ÷ (inter-trip gap + pickup time + ride time). Zone 3 loses to Zone 1 almost entirely because of the 32-min avg wait.")
+    with _s4b:
+        st.markdown(
+            '<div style="background:#1e1e2e;border-left:4px solid #ef4444;padding:16px 18px;'
+            'border-radius:6px;color:#e2e8f0;">'
+            '<strong>Once in Zone 3, drivers tend to stay.</strong><br><br>'
+            'Comparison drivers chain <strong>Z3→Z3 at higher rates</strong> than top 10 drivers. '
+            'After a Zone 3 drop-off, the next ping comes from a nearby Zone 3 pickup. There\'s no '
+            'natural exit without deliberately declining pings that would keep you there.<br><br>'
+            '<strong>Zone 3 at night (00:00–06:00) is different:</strong> longer trips heading into '
+            'the city, £32–43/hr, with a 03:00 peak of £43/hr. The early-shift archetype '
+            '(Marius, Abdi) exploits this deliberately.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── SECTION 5: What separates the categories ──────────────────────────────
+    st.divider()
+    st.subheader("5 — What separates the categories")
+    st.caption("Cat A through D are not just rankings — they reflect distinct behavioural patterns visible consistently across the fleet.")
+
+    _cat_cards = [
+        {
+            "cat": "A — Elite", "color": "#22c55e",
+            "headline": "High selectivity + premium positioning",
+            "bullets": [
+                "Lowest acceptance rates in the fleet — but highest RPH",
+                "Zone 1 & 2 pickup dominance; minimal unproductive Zone 3 time",
+                "West of Charing Cross during peak hours; no blind east stays",
+                "Long-haul trip bias: accepting Zone 5/6 dropoffs, filtering £10 shorts",
+                "Short gaps — utilisation high because wait time is spent in high-ping areas",
+            ],
+        },
+        {
+            "cat": "B1/B2 — Strong/Solid", "color": "#60a5fa",
+            "headline": "Consistent fundamentals, room to grow on selectivity",
+            "bullets": [
+                "Good west positioning (50–65% typically) and solid Zone 1 presence",
+                "Acceptance rate near fleet average (~50–60%) — not yet filtering aggressively",
+                "Some Zone 3 drift during off-peak hours that a Cat A avoids",
+                "RPH above fleet average, but the gap to Cat A lives in per-trip filtering",
+                "Shift discipline solid — tend to avoid the lowest-value early morning hours",
+            ],
+        },
+        {
+            "cat": "C1/C2 — Developing/Below avg", "color": "#f59e0b",
+            "headline": "Mixed positioning, inconsistent selectivity",
+            "bullets": [
+                "West % variable — well-positioned some days, drifting east on others",
+                "Higher Zone 3 pickup share; more sub-£10 local hops accepted",
+                "Accept rate elevated — not declining the low-value pings that dilute RPH",
+                "Longer median inter-trip gaps — wait time not spent repositioning",
+                "Pattern: Zone 3 drop → accept nearby cheap ping → stuck in Zone 3 all shift",
+            ],
+        },
+        {
+            "cat": "D — Low performer", "color": "#ef4444",
+            "headline": "Position or selectivity (or both) broken",
+            "bullets": [
+                "Either stuck in Zone 3/4 daytime or poorly positioned in outer east",
+                "High acceptance rate does not translate to earnings — accepting the noise",
+                "Sub-£10 trips making up 30–50%+ of accepted rides",
+                "Zone 3→Zone 3 chaining: one outer drop leads to the next, shift after shift",
+                "Key insight: some Cat D drivers are geographically well-placed but selectivity is broken",
+            ],
+        },
     ]
 
-    # Per-driver median longitude
-    def _driver_lon_stats(flow_raw, driver_ids, group_label):
-        df = flow_raw[flow_raw["status"].isin(["completed","Finished"])].copy()
-        rows = []
-        for did in driver_ids:
-            sub = df[df["dim_driver_id"] == did].head(500)
-            coords = sub["pickup_lat_long"].apply(parse_dms)
-            lons = [c[1] for c in coords if c[1] is not None and -0.55 < c[1] < 0.3]
-            if lons:
-                rows.append({
-                    "Driver":    DRIVER_NAMES.get(did, str(did)),
-                    "Median longitude": round(np.median(lons), 4),
-                    "West %":    round(sum(1 for l in lons if l < _WEST_LON) / len(lons) * 100, 1),
-                    "Group":     group_label,
-                })
-        return pd.DataFrame(rows)
-
-    with st.spinner("Computing positioning stats per driver..."):
-        good_lons = _driver_lon_stats(good_flow_raw, _GOOD_IDS, "Top 10")
-        bad_lons  = _driver_lon_stats(bad_flow_raw,  _BAD_IDS,  "Comparison")
-
-    lon_df = pd.concat([good_lons, bad_lons], ignore_index=True).sort_values("Median longitude")
-
-    # ── Map: pickup density good vs bad ──────────────────────────────────────
-    st.markdown("**Pickup location map** — green = top 10 drivers, red = comparison drivers")
-
-    m_pos = folium.Map(location=[51.505, -0.13], zoom_start=11, tiles="CartoDB dark_matter")
-    folium.GeoJson(
-        GEOJSON_DATA,
-        style_function=lambda f: {"fillColor": "#ffffff", "fillOpacity": 0.03,
-                                   "color": "#555", "weight": 1}
-    ).add_to(m_pos)
-
-    # Vertical reference line at west boundary (add as a note on the map via a marker)
-    folium.Marker(
-        [51.508, _WEST_LON],
-        icon=folium.DivIcon(
-            html='<div style="color:#facc15;font-size:11px;white-space:nowrap;'
-                 'font-weight:bold;">← West | East →</div>',
-            icon_size=(100, 20), icon_anchor=(50, 10),
-        ),
-        tooltip="Charing Cross longitude — high demand to the west"
-    ).add_to(m_pos)
-
-    for _, row in good_c.iterrows():
-        folium.CircleMarker(
-            [row["plat"], row["plon"]], radius=3,
-            color="#22c55e", fill=True, fill_opacity=0.35, weight=0,
-        ).add_to(m_pos)
-
-    for _, row in bad_c.iterrows():
-        folium.CircleMarker(
-            [row["plat"], row["plon"]], radius=3,
-            color="#ef4444", fill=True, fill_opacity=0.35, weight=0,
-        ).add_to(m_pos)
-
-    st_folium(m_pos, width="100%", height=460, returned_objects=[])
-
-    # ── Per-driver longitude chart ────────────────────────────────────────────
-    st.markdown("**Median pickup longitude per driver** — further left (more negative) = further west = better")
-    fig_lon = px.bar(
-        lon_df, x="Median longitude", y="Driver", orientation="h",
-        color="Group",
-        color_discrete_map={"Top 10": "#22c55e", "Comparison": "#ef4444"},
-        text="Median longitude",
-        title="Where each driver operates — median pickup longitude",
-    )
-    fig_lon.add_vline(x=_WEST_LON, line_dash="dash", line_color="#facc15",
-                      annotation_text="West boundary (-0.12°)", annotation_position="top")
-    fig_lon.update_traces(texttemplate="%{text:.3f}", textposition="outside")
-    fig_lon.update_layout(height=420, xaxis_title="Longitude (more negative = further west)")
-    st.plotly_chart(fig_lon, use_container_width=True)
-
-    # ── West % metric ─────────────────────────────────────────────────────────
-    good_west_pct = good_lons["West %"].mean() if not good_lons.empty else 0
-    bad_west_pct  = bad_lons["West %"].mean()  if not bad_lons.empty  else 0
-
-    cw1, cw2, cw3 = st.columns(3)
-    cw1.metric("Top 10 — pickups in west London",
-               f"{good_west_pct:.1f}%", "West of -0.12°")
-    cw2.metric("Comparison — pickups in west London",
-               f"{bad_west_pct:.1f}%",
-               delta=f"{bad_west_pct - good_west_pct:+.1f}%")
-    cw3.metric("West % gap",
-               f"{abs(good_west_pct - bad_west_pct):.1f}pp",
-               "Percentage point difference")
-
-    # ── West % per driver bar chart ───────────────────────────────────────────
-    fig_west = px.bar(
-        lon_df.sort_values("West %", ascending=True),
-        x="West %", y="Driver", orientation="h",
-        color="Group",
-        color_discrete_map={"Top 10": "#22c55e", "Comparison": "#ef4444"},
-        text="West %",
-        title="% of pickups in west London (west of Charing Cross line)",
-    )
-    fig_west.add_vline(x=50, line_dash="dash", line_color="#94a3b8",
-                       annotation_text="50% threshold")
-    fig_west.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-    fig_west.update_layout(height=420)
-    st.plotly_chart(fig_west, use_container_width=True)
-
-    # ── Narrative ─────────────────────────────────────────────────────────────
-    west_gap = good_west_pct - bad_west_pct
-    most_western_bad  = bad_lons.loc[bad_lons["Median longitude"].idxmin(),  "Driver"] if not bad_lons.empty  else "—"
-    most_eastern_good = good_lons.loc[good_lons["Median longitude"].idxmax(), "Driver"] if not good_lons.empty else "—"
-
-    st.markdown(
-        f'<div style="background:#1e1e2e;border-left:4px solid #facc15;'
-        f'padding:14px 16px;border-radius:6px;color:#e2e8f0;margin-top:8px;">'
-        f'<strong>📍 The positioning gap is {west_gap:.1f} percentage points.</strong> '
-        f'Top 10 drivers make <strong>{good_west_pct:.1f}%</strong> of their pickups west of the '
-        f'Charing Cross line vs <strong>{bad_west_pct:.1f}%</strong> for comparison drivers. '
-        f'This single metric explains the lower ping density during gaps — comparison drivers '
-        f'are in areas where demand is structurally lower. It\'s not that they\'re unlucky; '
-        f'they\'re in the wrong part of the city.<br><br>'
-        f'The west corridor (Mayfair, Kensington, Chelsea, Knightsbridge, Notting Hill, '
-        f'Hammersmith) generates higher-value pings and more of them. '
-        f'A driver sitting idle in Hackney or Stratford will wait longer and earn less '
-        f'than one sitting idle in South Kensington — not because of decisions made during the gap, '
-        f'but because of where the previous trip left them.<br><br>'
-        f'<strong>The fix isn\'t just "decline bad trips" — it\'s deliberately positioning westward. '
-        f'That means declining trips heading east even when the fare looks acceptable, '
-        f'because the positioning cost on the other end is higher than the fare gained.</strong>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    # ── SECTION 7: What the data is telling us ────────────────────────────────
-    st.divider()
-    st.subheader("7 — What the data is telling us")
-
-    rph_gap      = ga["RPH"] - ba["RPH"]
-    fare_gap     = good_fares.median() - bad_fares.median()
-    accept_gap   = ba["Acceptance %"] - ga["Acceptance %"]
-    sub10_gap    = sub10_bad - sub10_good
-
-    # Zone-level findings from diff matrix
-    z1z1_good = good_mat.loc[1, 1] if 1 in good_mat.index and 1 in good_mat.columns else 0
-    z1z1_bad  = bad_mat.loc[1, 1]  if 1 in bad_mat.index  and 1 in bad_mat.columns  else 0
-    z1_out_good = sum(good_mat.loc[1, z] for z in range(2, 7)
-                      if z in good_mat.columns) if 1 in good_mat.index else 0
-    z1_out_bad  = sum(bad_mat.loc[1, z]  for z in range(2, 7)
-                      if z in bad_mat.columns)  if 1 in bad_mat.index  else 0
-
-    # Peak hour comparison
-    good_peak = good_hr.loc[good_hr["trips"].idxmax(), "trips_hr"] if not good_hr.empty else "?"
-    bad_peak  = bad_hr.loc[bad_hr["trips"].idxmax(),  "trips_hr"]  if not bad_hr.empty  else "?"
-
-    findings = []
-
-    # RPH gap
-    findings.append(
-        f"**The RPH gap is £{rph_gap:.2f}/hr.** "
-        f"Top 10 average £{ga['RPH']:.2f}/hr vs comparison drivers at £{ba['RPH']:.2f}/hr. "
-        f"Over a 9-hour shift that's £{rph_gap*9:.0f} less per day — "
-        f"roughly £{rph_gap*9*5:.0f}/week per driver."
-    )
-
-    # Acceptance rate
-    if accept_gap > 5:
-        findings.append(
-            f"**Comparison drivers accept {accept_gap:.1f}% more pings.** "
-            f"Higher acceptance isn't a virtue here — it means they're taking trips the top 10 "
-            f"are deliberately passing on. That selectivity gap is a large part of the RPH difference."
-        )
-    elif accept_gap < -5:
-        findings.append(
-            f"**Comparison drivers actually accept {abs(accept_gap):.1f}% fewer pings** than the top 10 — "
-            f"but their RPH is still lower, which suggests they're declining the wrong trips "
-            f"(possibly good-value ones) rather than the right ones (short low-fare hops)."
-        )
-    else:
-        findings.append(
-            f"**Acceptance rates are similar** ({ga['Acceptance %']:.1f}% vs {ba['Acceptance %']:.1f}%) — "
-            f"the RPH gap isn't about volume of pings accepted. It's about which ones they take."
-        )
-
-    # Fare gap
-    if fare_gap > 2:
-        findings.append(
-            f"**Median fare is £{fare_gap:.2f} lower per trip for comparison drivers** "
-            f"(£{bad_fares.median():.2f} vs £{good_fares.median():.2f}). "
-            f"Across {int(ba['Total rides']):,} rides that compounds fast. "
-            + (f"Comparison drivers take {sub10_gap:+.1f}% more sub-£10 trips — "
-               f"these are the short Zone 1 hops that kill your hourly rate."
-               if sub10_gap > 3 else
-               f"The fare gap is spread across the distribution, not just in the sub-£10 bracket.")
-        )
-    else:
-        findings.append(
-            f"**Fare per trip is surprisingly similar** (median £{good_fares.median():.2f} vs £{bad_fares.median():.2f}). "
-            f"The RPH gap isn't coming from trip size — it's more likely gap time between trips "
-            f"or working the wrong hours."
-        )
-
-    # Zone flow
-    if z1z1_bad - z1z1_good > 3:
-        findings.append(
-            f"**Zone 1→Zone 1 short hops: comparison drivers take {z1z1_bad:.1f}% of trips on this route "
-            f"vs {z1z1_good:.1f}% for the top 10.** This is the clearest behavioural difference. "
-            f"Z1→Z1 runs a full-cycle RPH of ~£20/hr — below the fleet average. "
-            f"The top 10 pass on these and wait for better pings."
-        )
-    elif z1_out_good - z1_out_bad > 3:
-        findings.append(
-            f"**Top 10 drivers take significantly more Zone 1 outbound trips** "
-            f"({z1_out_good:.1f}% vs {z1_out_bad:.1f}% of all trips). "
-            f"These are the higher-value runs — longer distance, better fare, "
-            f"and they often come with a strong return ping at the destination."
-        )
-
-    # Hour of day
-    if good_peak != bad_peak:
-        findings.append(
-            f"**Peak hour differs: top 10 peak at {int(good_peak):02d}:00, "
-            f"comparison drivers peak at {int(bad_peak):02d}:00.** "
-            + ("Comparison drivers are more active in the midday lull when fares are shorter "
-               "and ping density is lower."
-               if int(bad_peak) in range(10, 16) and int(good_peak) not in range(10, 16)
-               else
-               "Check whether comparison drivers are missing the evening surge window "
-               "that top 10 drivers consistently exploit.")
-        )
-
-    # Render findings as cards
-    for i, finding in enumerate(findings):
-        icon = ["💰", "🎯", "🧾", "🗺️", "🕐"][i % 5]
+    for _card in _cat_cards:
         st.markdown(
-            f'<div style="background:#1e1e2e;border-left:4px solid #6366f1;'
-            f'padding:12px 16px;border-radius:6px;margin-bottom:10px;color:#e2e8f0;">'
-            f'<span style="font-size:18px;">{icon}</span> {finding}'
+            f'<div style="background:#1e1e2e;border-left:4px solid {_card["color"]};'
+            f'padding:14px 18px;border-radius:6px;color:#e2e8f0;margin-bottom:10px;">'
+            f'<div style="color:{_card["color"]};font-size:12px;font-weight:bold;letter-spacing:1px;">{_card["cat"]}</div>'
+            f'<div style="font-size:14px;font-weight:600;color:#f8fafc;margin:4px 0 10px 0;">{_card["headline"]}</div>'
+            f'{"".join(f"""<div style=\'font-size:12px;line-height:1.9;\'>· {b}</div>""" for b in _card["bullets"])}'
             f'</div>',
             unsafe_allow_html=True,
         )
 
-    # One-line summary
-    st.markdown("---")
-    primary_cause = (
-        "taking too many short Zone 1→Zone 1 hops" if z1z1_bad - z1z1_good > 3
-        else "accepting lower-fare trips the top 10 decline" if fare_gap > 2
-        else "lower selectivity across the board — higher acceptance, lower average return"
-    )
-    st.success(
-        f"**Bottom line:** The £{rph_gap:.2f}/hr gap is primarily driven by **{primary_cause}**. "
-        f"The top 10 aren't working harder — they're working the same hours but saying no "
-        f"more often to the trips that drag your average down."
+    st.markdown(
+        '<div style="background:#1e1e2e;border-left:4px solid #6366f1;padding:14px 16px;'
+        'border-radius:6px;color:#e2e8f0;">'
+        'The core lever is the same across all categories: <strong>lower your acceptance threshold '
+        'and reposition before going available after a Zone 3 drop.</strong> Cat A drivers do both '
+        'consistently. Cat B does one of the two. Cat C/D do neither reliably.'
+        '</div>',
+        unsafe_allow_html=True,
     )
 
-# ── Fleet Map ────────────────────────────────────────────────────────────────
+    # ── SECTION 6: Three groups, three realities ──────────────────────────────
+    st.divider()
+    st.subheader("6 — Three groups, three realities")
+    st.caption("Top 10 elite drivers vs 5 specific comparison drivers vs the rest of the fleet — zone flow, gaps, positioning, fare quality side by side.")
+
+    with st.spinner("Loading fleet driver IDs..."):
+        _all_fleet_ids = db.load_fleet_driver_ids(days_back=30)
+        _top10_set = set(TOP_DRIVER_IDS)
+        _cmp_set   = set(BAD_DRIVER_IDS)
+        _rest_ids  = [i for i in _all_fleet_ids if i not in _top10_set and i not in _cmp_set]
+
+    with st.spinner("Loading performance data for all groups..."):
+        _perf_top  = db.load_comparison_performance(list(TOP_DRIVER_IDS))
+        _perf_cmp  = db.load_comparison_performance(list(BAD_DRIVER_IDS))
+        _perf_rest = db.load_comparison_performance(_rest_ids)
+
+    with st.spinner("Loading zone flow (30 days)..."):
+        _flow_top  = db.load_comparison_flow(list(TOP_DRIVER_IDS), days_back=30)
+        _flow_cmp  = db.load_comparison_flow(list(BAD_DRIVER_IDS), days_back=30)
+        _flow_rest = db.load_comparison_flow(_rest_ids, days_back=30)
+
+    with st.spinner("Enriching zone matrices..."):
+        _mat_top  = _ff_zone_matrix(_flow_top)
+        _mat_cmp  = _ff_zone_matrix(_flow_cmp)
+        _mat_rest = _ff_zone_matrix(_flow_rest)
+
+    with st.spinner("Loading gap data (14 days)..."):
+        _gaps_top  = db.load_gap_accepted(list(TOP_DRIVER_IDS), days_back=14)
+        _gaps_cmp  = db.load_gap_accepted(list(BAD_DRIVER_IDS), days_back=14)
+        _gaps_rest = db.load_gap_accepted(_rest_ids, days_back=14)
+
+    with st.spinner("Loading declined ping data..."):
+        _dec_top  = db.load_gap_declined(list(TOP_DRIVER_IDS), days_back=14)
+        _dec_cmp  = db.load_gap_declined(list(BAD_DRIVER_IDS), days_back=14)
+        _dec_rest = db.load_gap_declined(_rest_ids, days_back=14)
+
+    # Aggregate stats
+    _rph_top  = _perf_top["rph"].mean()  if not _perf_top.empty  else 0
+    _rph_cmp  = _perf_cmp["rph"].mean()  if not _perf_cmp.empty  else 0
+    _rph_rest = _FLEET_RPH
+
+    _acc_top  = _perf_top["acceptance"].mean()  if not _perf_top.empty  else 0
+    _acc_cmp  = _perf_cmp["acceptance"].mean()  if not _perf_cmp.empty  else 0
+    _acc_rest = _FLEET_ACCEPT
+
+    def _avg_fare(flow):
+        f = flow[flow["status"].isin(["completed", "Finished"])]["trip_price_in_pound"] if not flow.empty else pd.Series()
+        return f.mean() if len(f) else 0
+
+    def _sub10_pct(flow):
+        f = flow[flow["status"].isin(["completed", "Finished"])]["trip_price_in_pound"] if not flow.empty else pd.Series()
+        return (f < 10).mean() * 100 if len(f) else 0
+
+    _fare_top  = _avg_fare(_flow_top)
+    _fare_cmp  = _avg_fare(_flow_cmp)
+    _fare_rest = _avg_fare(_flow_rest)
+    _sub10_top  = _sub10_pct(_flow_top)
+    _sub10_cmp  = _sub10_pct(_flow_cmp)
+    _sub10_rest = _sub10_pct(_flow_rest)
+    _west_top  = _flow_west_pct(_flow_top)
+    _west_cmp  = _flow_west_pct(_flow_cmp)
+    _west_rest = _flow_west_pct(_flow_rest)
+
+    _gb_top  = _gap_buckets(_compute_gaps(_gaps_top))
+    _gb_cmp  = _gap_buckets(_compute_gaps(_gaps_cmp))
+    _gb_rest = _gap_buckets(_compute_gaps(_gaps_rest))
+
+    # Scorecards
+    st.markdown("#### At a glance — six metrics, three groups")
+    _sc1, _sc2, _sc3 = st.columns(3)
+    _scorecard(_sc1, "TOP 10 ELITE",         "#22c55e", _rph_top,  _acc_top,  _fare_top,  _sub10_top,  _west_top,  _gb_top["median"],  _gb_top["<25m"])
+    _scorecard(_sc2, "REST OF FLEET",        "#94a3b8", _rph_rest, _acc_rest, _fare_rest, _sub10_rest, _west_rest, _gb_rest["median"], _gb_rest["<25m"])
+    _scorecard(_sc3, "COMPARISON (WORST 5)", "#ef4444", _rph_cmp,  _acc_cmp,  _fare_cmp,  _sub10_cmp,  _west_cmp,  _gb_cmp["median"],  _gb_cmp["<25m"])
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Zone heatmaps
+    st.markdown("#### Zone flow: Top 10 vs Comparison (extreme ends)")
+    st.caption("Last 30 days accepted trips — % of trips on each pickup→dropoff route")
+    _hm1, _hm2 = st.columns(2)
+    with _hm1:
+        _fig_hm_top = px.imshow(_mat_top, text_auto=".1f", color_continuous_scale="Blues",
+                                labels=dict(x="Dropoff zone", y="Pickup zone", color="% trips"),
+                                title="Top 10 — zone flow (%)", aspect="equal")
+        _fig_hm_top.update_layout(height=360)
+        st.plotly_chart(_fig_hm_top, use_container_width=True)
+    with _hm2:
+        _fig_hm_cmp = px.imshow(_mat_cmp, text_auto=".1f", color_continuous_scale="Reds",
+                                labels=dict(x="Dropoff zone", y="Pickup zone", color="% trips"),
+                                title="Comparison — zone flow (%)", aspect="equal")
+        _fig_hm_cmp.update_layout(height=360)
+        st.plotly_chart(_fig_hm_cmp, use_container_width=True)
+
+    # Z1 vs Z3 bar
+    _z1p = lambda m: m.loc[1].sum() if 1 in m.index else 0
+    _z3p = lambda m: m.loc[3].sum() if 3 in m.index else 0
+    _z3c = lambda m: _safe_cell(m, 3, 3)
+    _z1c = lambda m: _safe_cell(m, 1, 1)
+    _ff_zone_cmp = pd.DataFrame([
+        {"Zone": "Z1 pickup",   "Top 10": _z1p(_mat_top), "Rest of fleet": _z1p(_mat_rest), "Comparison": _z1p(_mat_cmp)},
+        {"Zone": "Z1→Z1 chain", "Top 10": _z1c(_mat_top), "Rest of fleet": _z1c(_mat_rest), "Comparison": _z1c(_mat_cmp)},
+        {"Zone": "Z3 pickup",   "Top 10": _z3p(_mat_top), "Rest of fleet": _z3p(_mat_rest), "Comparison": _z3p(_mat_cmp)},
+        {"Zone": "Z3→Z3 chain", "Top 10": _z3c(_mat_top), "Rest of fleet": _z3c(_mat_rest), "Comparison": _z3c(_mat_cmp)},
+    ])
+    _fig_zcmp = px.bar(
+        _ff_zone_cmp.melt(id_vars="Zone", var_name="Group", value_name="% of trips"),
+        x="Zone", y="% of trips", color="Group", barmode="group",
+        color_discrete_map={"Top 10": "#22c55e", "Rest of fleet": "#94a3b8", "Comparison": "#ef4444"},
+        category_orders={"Group": ["Top 10", "Rest of fleet", "Comparison"]},
+        text_auto=".1f", title="Zone 1 vs Zone 3 — all three groups", height=360,
+    )
+    _fig_zcmp.update_layout(yaxis_ticksuffix="%")
+    st.plotly_chart(_fig_zcmp, use_container_width=True)
+
+    # Gap distribution
+    st.markdown("#### Inter-trip gap distribution — all three groups (last 14 days)")
+    st.caption("<25 min = productive flow · 25–75 min = stranded · >75 min = break or app off")
+    _gap_df = pd.DataFrame([
+        {"Group": "Top 10",        "<25m": _gb_top["<25m"],  "25–75m": _gb_top["25–75m"],  ">75m": _gb_top[">75m"]},
+        {"Group": "Rest of fleet", "<25m": _gb_rest["<25m"], "25–75m": _gb_rest["25–75m"], ">75m": _gb_rest[">75m"]},
+        {"Group": "Comparison",    "<25m": _gb_cmp["<25m"],  "25–75m": _gb_cmp["25–75m"],  ">75m": _gb_cmp[">75m"]},
+    ]).melt(id_vars="Group", var_name="Bucket", value_name="% of gaps")
+    _fig_gaps = px.bar(
+        _gap_df, x="Group", y="% of gaps", color="Bucket", barmode="stack",
+        color_discrete_map={"<25m": "#22c55e", "25–75m": "#f59e0b", ">75m": "#ef4444"},
+        category_orders={"Group": ["Top 10", "Rest of fleet", "Comparison"]},
+        title="Gap distribution — Top 10 vs Rest vs Comparison", height=340,
+    )
+    _fig_gaps.update_layout(yaxis_ticksuffix="%", legend_title="Gap bucket")
+    st.plotly_chart(_fig_gaps, use_container_width=True)
+
+    # East/West fare quality
+    st.markdown("#### East vs West fare quality — all three groups (last 30 days)")
+    with st.spinner("Computing east/west fare split..."):
+        _ew_top  = _ew_parse_and_flag(_flow_top)
+        _ew_cmp  = _ew_parse_and_flag(_flow_cmp)
+        _ew_rest = _ew_parse_and_flag(_flow_rest)
+
+    _ew_rows = []
+    for _grp_label, _grp_df in [("Top 10", _ew_top), ("Rest of fleet", _ew_rest), ("Comparison", _ew_cmp)]:
+        for _side, _side_label in [(True, "West (<−0.12°)"), (False, "East (≥−0.12°)")]:
+            _sg = _grp_df[_grp_df["is_west"] == _side] if not _grp_df.empty else pd.DataFrame()
+            if len(_sg) == 0:
+                continue
+            _ew_rows.append({
+                "Group":       _grp_label,
+                "Side":        _side_label,
+                "Avg fare (£)": round(_sg["trip_price_in_pound"].mean(), 2),
+                "Sub-£10 %":   round((_sg["trip_price_in_pound"] < 10).mean() * 100, 1),
+            })
+    _ew_df = pd.DataFrame(_ew_rows)
+
+    if not _ew_df.empty:
+        _ew_c1, _ew_c2 = st.columns(2)
+        with _ew_c1:
+            _fig_ew1 = px.bar(_ew_df, x="Group", y="Avg fare (£)", color="Side", barmode="group",
+                              color_discrete_map={"West (<−0.12°)": "#60a5fa", "East (≥−0.12°)": "#fb923c"},
+                              category_orders={"Group": ["Top 10", "Rest of fleet", "Comparison"]},
+                              text="Avg fare (£)", title="Avg fare — East vs West", height=340)
+            _fig_ew1.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
+            st.plotly_chart(_fig_ew1, use_container_width=True)
+        with _ew_c2:
+            _fig_ew2 = px.bar(_ew_df, x="Group", y="Sub-£10 %", color="Side", barmode="group",
+                              color_discrete_map={"West (<−0.12°)": "#60a5fa", "East (≥−0.12°)": "#fb923c"},
+                              category_orders={"Group": ["Top 10", "Rest of fleet", "Comparison"]},
+                              text="Sub-£10 %", title="Sub-£10 rate — East vs West", height=340)
+            _fig_ew2.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+            _fig_ew2.update_layout(yaxis_ticksuffix="%")
+            st.plotly_chart(_fig_ew2, use_container_width=True)
+
+    # Ping analysis
+    st.divider()
+    st.markdown("#### Ping volume, location & quality")
+    st.caption("Last 14 days · accepted + declined pings · normalised per driver per day")
+
+    _ps_top  = _ping_stats(_gaps_top,  _dec_top,  len(TOP_DRIVER_IDS))
+    _ps_cmp  = _ping_stats(_gaps_cmp,  _dec_cmp,  len(BAD_DRIVER_IDS))
+    _ps_rest = _ping_stats(_gaps_rest, _dec_rest, len(_rest_ids))
+
+    _pv1, _pv2, _pv3 = st.columns(3)
+    for _col, _label, _color, _ps in [
+        (_pv1, "TOP 10",        "#22c55e", _ps_top),
+        (_pv2, "REST OF FLEET", "#94a3b8", _ps_rest),
+        (_pv3, "COMPARISON",    "#ef4444", _ps_cmp),
+    ]:
+        _rows = [
+            ("Pings/driver/day",    str(_ps["pings_per_dd"])),
+            ("Accepted/driver/day", str(_ps["acc_per_dd"])),
+            ("Acceptance rate",     f"{_ps['accept_rate']:.0f}%"),
+            ("West ping source",    f"{_ps['west_pings_pct']:.0f}%"),
+            ("Declined avg fare",   f"£{_ps['dec_avg_fare']:.2f}" if _ps["dec_avg_fare"] else "—"),
+            ("Declined sub-£10",    f"{_ps['dec_sub10_pct']:.0f}%" if _ps["dec_avg_fare"] else "—"),
+            ("Declined £30+",       f"{_ps['dec_30p_pct']:.0f}%" if _ps["dec_avg_fare"] else "—"),
+        ]
+        _body = "".join(
+            f'<tr><td style="padding:4px 0;color:#94a3b8;font-size:12px;">{k}</td>'
+            f'<td style="text-align:right;font-weight:bold;color:#f8fafc;font-size:13px;">{v}</td></tr>'
+            for k, v in _rows
+        )
+        _col.markdown(
+            f'<div style="background:#1e1e2e;border:2px solid {_color};border-radius:8px;padding:14px 16px;">'
+            f'<div style="color:{_color};font-size:11px;font-weight:bold;letter-spacing:1px;margin-bottom:6px;">{_label}</div>'
+            f'<table style="width:100%;border-collapse:collapse;">{_body}</table>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    _pp1, _pp2 = st.columns(2)
+    with _pp1:
+        _ping_src = pd.DataFrame([
+            {"Group": "Top 10",        "West %": _ps_top["west_pings_pct"],  "East %": 100 - _ps_top["west_pings_pct"]},
+            {"Group": "Rest of fleet", "West %": _ps_rest["west_pings_pct"], "East %": 100 - _ps_rest["west_pings_pct"]},
+            {"Group": "Comparison",    "West %": _ps_cmp["west_pings_pct"],  "East %": 100 - _ps_cmp["west_pings_pct"]},
+        ]).melt(id_vars="Group", var_name="Side", value_name="% of pings")
+        _fig_psrc = px.bar(_ping_src, x="Group", y="% of pings", color="Side", barmode="stack",
+                           color_discrete_map={"West %": "#60a5fa", "East %": "#fb923c"},
+                           category_orders={"Group": ["Top 10", "Rest of fleet", "Comparison"]},
+                           text_auto=".1f", title="Ping source — East vs West", height=340)
+        _fig_psrc.update_layout(yaxis_ticksuffix="%", legend_title="Ping source")
+        st.plotly_chart(_fig_psrc, use_container_width=True)
+
+    with _pp2:
+        _dec_fare_rows = []
+        for _glabel, _dec_df in [("Top 10", _dec_top), ("Rest of fleet", _dec_rest), ("Comparison", _dec_cmp)]:
+            if _dec_df.empty:
+                continue
+            _fares = _dec_df["trip_price_in_pound"].dropna()
+            _fares = _fares[_fares > 0]
+            if len(_fares) == 0:
+                continue
+            for _band, _mask in [
+                ("Sub-£10",  _fares < 10),
+                ("£10–20",  (_fares >= 10) & (_fares < 20)),
+                ("£20–30",  (_fares >= 20) & (_fares < 30)),
+                ("£30+",     _fares >= 30),
+            ]:
+                _dec_fare_rows.append({"Group": _glabel, "Fare band": _band,
+                                       "% of declined": round(_mask.mean() * 100, 1)})
+        if _dec_fare_rows:
+            _fig_df = px.bar(pd.DataFrame(_dec_fare_rows), x="Group", y="% of declined",
+                             color="Fare band", barmode="stack",
+                             color_discrete_map={"Sub-£10": "#ef4444", "£10–20": "#f59e0b",
+                                                 "£20–30": "#60a5fa", "£30+": "#22c55e"},
+                             category_orders={"Group": ["Top 10", "Rest of fleet", "Comparison"]},
+                             title="Quality of pings each group is declining", height=340)
+            _fig_df.update_layout(yaxis_ticksuffix="%", legend_title="Fare band")
+            st.plotly_chart(_fig_df, use_container_width=True)
+
+    _ppd = pd.DataFrame([
+        {"Group": "Top 10",        "Metric": "Total pings/driver/day",    "Value": _ps_top["pings_per_dd"]},
+        {"Group": "Rest of fleet", "Metric": "Total pings/driver/day",    "Value": _ps_rest["pings_per_dd"]},
+        {"Group": "Comparison",    "Metric": "Total pings/driver/day",    "Value": _ps_cmp["pings_per_dd"]},
+        {"Group": "Top 10",        "Metric": "Accepted pings/driver/day", "Value": _ps_top["acc_per_dd"]},
+        {"Group": "Rest of fleet", "Metric": "Accepted pings/driver/day", "Value": _ps_rest["acc_per_dd"]},
+        {"Group": "Comparison",    "Metric": "Accepted pings/driver/day", "Value": _ps_cmp["acc_per_dd"]},
+    ])
+    _fig_ppd = px.bar(_ppd, x="Metric", y="Value", color="Group", barmode="group",
+                      color_discrete_map={"Top 10": "#22c55e", "Rest of fleet": "#94a3b8", "Comparison": "#ef4444"},
+                      category_orders={"Group": ["Top 10", "Rest of fleet", "Comparison"]},
+                      text_auto=".1f", title="Ping volume — total vs accepted per driver per day", height=340)
+    st.plotly_chart(_fig_ppd, use_container_width=True)
+
+    _z3p_top_val = _z3p(_mat_top)
+    _z3p_cmp_val = _z3p(_mat_cmp)
+    st.markdown(
+        f'<div style="background:#1e1e2e;border-left:4px solid #a78bfa;padding:14px 16px;'
+        f'border-radius:6px;color:#e2e8f0;">'
+        f'<strong>Why comparison drivers see fewer (and worse) pings:</strong><br><br>'
+        f'<strong>1. Location.</strong> Comparison get <strong>{_ps_cmp["west_pings_pct"]:.0f}%</strong> of pings '
+        f'from west of Charing Cross vs <strong>{_ps_top["west_pings_pct"]:.0f}%</strong> for the top 10.<br><br>'
+        f'<strong>2. Zone 3 trap self-reinforces.</strong> Accepting a Z3 drop → stranded → low ping volume → '
+        f'accept the next ping out of desperation → probably another Z3 trip.<br><br>'
+        f'<strong>3. Quality of what they see.</strong> Even pings comparison drivers decline are '
+        f'<strong>{_ps_cmp["dec_sub10_pct"]:.0f}% sub-£10</strong>. Top 10 decline pings worth '
+        f'<strong>£{_ps_top["dec_avg_fare"]:.2f} avg</strong> — they\'re filtering a higher-quality offer pool.'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── SECTION 7: Decision gap ───────────────────────────────────────────────
+    st.divider()
+    st.subheader("7 — It's a decision gap, not a location gap")
+    st.caption("Same streets. Same pings on screen. Completely different acceptance thresholds.")
+
+    _same_df = pd.DataFrame([
+        {"Category": "Cat A (sample)", "Pings": 230, "Accepted": 29,  "Accept %": 12.6, "Avg fare £": 25.27, "Sub-£10 %": 0,  "£20+ %": 79},
+        {"Category": "Cat D (sample)", "Pings": 254, "Accepted": 94,  "Accept %": 37.0, "Avg fare £": 11.80, "Sub-£10 %": 51, "£20+ %": 12},
+    ])
+
+    _sl1, _sl2 = st.columns(2)
+    with _sl1:
+        _fig_sf = px.bar(_same_df, x="Category", y="Avg fare £", color="Category",
+                         color_discrete_map={"Cat A (sample)": "#22c55e", "Cat D (sample)": "#ef4444"},
+                         text="Avg fare £", title="Avg fare — same City/Inner East streets", height=300)
+        _fig_sf.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
+        _fig_sf.update_layout(showlegend=False, yaxis_range=[0, 32])
+        st.plotly_chart(_fig_sf, use_container_width=True)
+    with _sl2:
+        _fig_ss = px.bar(_same_df, x="Category", y="Sub-£10 %", color="Category",
+                         color_discrete_map={"Cat A (sample)": "#22c55e", "Cat D (sample)": "#ef4444"},
+                         text="Sub-£10 %", title="Sub-£10 rate — same location", height=300)
+        _fig_ss.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
+        _fig_ss.update_layout(showlegend=False, yaxis_ticksuffix="%", yaxis_range=[0, 65])
+        st.plotly_chart(_fig_ss, use_container_width=True)
+
+    st.dataframe(_same_df.set_index("Category"), use_container_width=True)
+    st.caption("City of London / Clerkenwell / Inner East. Full 2026 dataset. Cat A accepted 13%, Cat D accepted 37% — from the same pool of pings.")
+
+    st.markdown(
+        '<div style="background:#1e1e2e;border-left:4px solid #6366f1;padding:14px 16px;'
+        'border-radius:6px;color:#e2e8f0;margin-top:8px;">'
+        'Cat A: <strong>£25.27 avg fare</strong>, 0% sub-£10. '
+        'Cat D: <strong>£11.80 avg fare</strong>, 51% sub-£10. '
+        'The location is identical. The pings are identical. '
+        '<strong>The earnings gap is entirely a decision gap — it happens at the moment of acceptance.</strong>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── SECTION 8: Fleet map ──────────────────────────────────────────────────
+    st.divider()
+    st.subheader("8 — Where the fleet actually operates")
+    st.caption("Pickup density — every active driver, last 30 days, coloured by performance category.")
+
+    with st.spinner("Loading fleet positioning data..."):
+        _ff_cat_df  = pd.read_csv(_CAT_PATH)
+        _ff_cat_map = dict(zip(_ff_cat_df["dim_driver_id"], _ff_cat_df["category"]))
+        _ff_raw     = db.load_all_driver_coords(sample_per_driver=60, days_back=30)
+
+    if not _ff_raw.empty:
+        _ff_raw["category"] = _ff_raw["dim_driver_id"].map(_ff_cat_map)
+        _ff_raw["category"] = _ff_raw["category"].where(
+            _ff_raw["category"].isin(["A", "B1", "B2", "C1", "C2", "D"]), other=None
+        )
+        _ff_coords = _ff_raw["pickup_lat_long"].apply(parse_dms)
+        _ff_raw["plat"] = [c[0] for c in _ff_coords]
+        _ff_raw["plon"] = [c[1] for c in _ff_coords]
+        _ff_fleet = _ff_raw.dropna(subset=["plat", "plon"])
+        _ff_fleet = _ff_fleet[_ff_fleet["plat"].between(51.3, 51.7) & _ff_fleet["plon"].between(-0.55, 0.3)].copy()
+        _ff_fleet["cat_label"] = _ff_fleet["category"].map(CAT_LABELS).fillna("Unclassified")
+
+        _cat_order_labels = ["Unclassified", "D — Low performer", "C2 — Below avg", "C1 — Developing",
+                             "B2 — Solid", "B1 — Strong", "A — Elite"]
+        _color_map_labels = {CAT_LABELS.get(k, "Unclassified"): v for k, v in CAT_COLORS.items() if k is not None}
+        _color_map_labels["Unclassified"] = "#94a3b8"
+
+        _ff_fig_map = px.scatter_mapbox(
+            _ff_fleet.sort_values("cat_label", key=lambda s: s.map({v: i for i, v in enumerate(_cat_order_labels)})),
+            lat="plat", lon="plon",
+            color="cat_label",
+            color_discrete_map=_color_map_labels,
+            category_orders={"cat_label": _cat_order_labels},
+            hover_name="driver_full_name",
+            hover_data={"plat": False, "plon": False, "cat_label": True},
+            zoom=10, height=520,
+            mapbox_style="carto-positron",
+            opacity=0.6,
+            title="Fleet pickup density — last 30 days",
+        )
+        _ff_fig_map.update_traces(marker=dict(size=5))
+        _ff_fig_map.update_layout(
+            margin=dict(l=0, r=0, t=40, b=0),
+            legend=dict(title="Category", x=0.01, y=0.99, bgcolor="rgba(30,30,46,0.85)", bordercolor="#555", borderwidth=1),
+        )
+        st.plotly_chart(_ff_fig_map, use_container_width=True)
+
+        # West % bar
+        _west_rows = []
+        for _, _grp in _ff_fleet.groupby("dim_driver_id"):
+            _did = _grp["dim_driver_id"].iloc[0]
+            _cat = _grp["category"].iloc[0] if pd.notna(_grp["category"].iloc[0]) else None
+            _lons = _grp["plon"].dropna()
+            _west_rows.append({
+                "Driver":   DRIVER_NAMES.get(_did, _grp["driver_full_name"].iloc[0]),
+                "Category": _cat if _cat else "—",
+                "West %":   round((_lons < _WEST_LON).mean() * 100, 1),
+            })
+        _west_df = pd.DataFrame(_west_rows)
+        _cat_sort = ["A", "B1", "B2", "C1", "C2", "D", "—"]
+        _west_df["_s"] = _west_df["Category"].map({c: i for i, c in enumerate(_cat_sort)})
+        _west_df = _west_df.sort_values(["_s", "West %"], ascending=[True, False]).drop(columns="_s")
+
+        _cmap2 = {"A": "#22c55e", "B1": "#4ade80", "B2": "#60a5fa",
+                  "C1": "#f59e0b", "C2": "#fb923c", "D": "#ef4444", "—": "#94a3b8"}
+        _fig_west = px.bar(_west_df, x="West %", y="Driver", orientation="h",
+                           color="Category", color_discrete_map=_cmap2, text="West %",
+                           title="West London pickup % — all drivers",
+                           height=max(480, len(_west_df) * 20 + 80))
+        _fig_west.add_vline(x=50, line_dash="dash", line_color="#94a3b8",
+                            annotation_text="50%", annotation_position="top")
+        _fig_west.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
+        _fig_west.update_layout(xaxis_title="% pickups west of −0.12°", yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(_fig_west, use_container_width=True)
+
+        # Summary stats table
+        _cat_summ = (
+            _west_df.groupby("Category")["West %"]
+            .agg(Drivers="count", Mean="mean", Median="median", Min="min", Max="max")
+            .round(1).reset_index()
+        )
+        _cat_summ["_s"] = _cat_summ["Category"].map({c: i for i, c in enumerate(_cat_sort)})
+        _cat_summ = _cat_summ.sort_values("_s").drop(columns="_s")
+        st.dataframe(_cat_summ, use_container_width=True, hide_index=True)
+    else:
+        st.warning("Fleet positioning data not available.")
+
+    # ── SECTION 9: Key takeaways ──────────────────────────────────────────────
+    st.divider()
+    st.subheader("9 — Key takeaways")
+    st.markdown(f"""
+| # | Finding | Key stat | Implication |
+|---|---------|----------|-------------|
+| 1 | **Lower acceptance = higher RPH** | Top 10: {_ff_top10_accept:.0f}% accept vs Fleet: {_FLEET_ACCEPT}% | Selectivity is the strategy, not volume |
+| 2 | **West positioning generates better pings** | Cat A outliers still beat Cat D despite lower west % | Positioning helps — selectivity converts it |
+| 3 | **Zone 3 daytime is a trap** | True RPH ~£17/hr + 32 min avg wait | Leave or decline until clear before 09:00 |
+| 4 | **Zone 3 at night is valuable** | £32–43/hr, peaks £43/hr at 03:00 | Night shift: Zone 3 00:00–06:00 is valid |
+| 5 | **Cat A/B/C/D reflect distinct behaviours** | Not a ranking — a pattern of decisions | Each category has a clear behavioural signature |
+| 6 | **Position helps but selectivity converts** | Cat D driver at 93% west still underperforms | Moving west without filtering just earns cheap trips in a premium area |
+| 7 | **It's a decision gap, not a location gap** | Cat A: £25.27 avg · Cat D: £11.80 avg, same streets | The earnings difference happens at the moment of acceptance |
+    """)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FLEET MAP
+# ═══════════════════════════════════════════════════════════════════════════════
 elif page == "Fleet Map":
     st.title("Fleet Positioning Map")
-    st.caption(
-        "Every active driver's pickup locations over the last 30 days, coloured by 2026 performance category from the daily dashboard."
-    )
+    st.caption("Every active driver's pickup locations over the last 30 days, coloured by performance category.")
 
-    _WEST_LON = -0.12
-
-    # ── Load category classifications from Excel export ────────────────────────
-    _CAT_PATH = os.path.join(os.path.dirname(__file__), "driver_categories.csv")
-    _cat_df   = pd.read_csv(_CAT_PATH)
-    _cat_map  = dict(zip(_cat_df["dim_driver_id"], _cat_df["category"]))
-
-    CAT_COLOR = {
-        "A":  "#22c55e",   # green  — top tier
-        "B1": "#4ade80",   # light green
-        "B2": "#60a5fa",   # blue
-        "C1": "#f59e0b",   # amber
-        "C2": "#fb923c",   # orange
-        "D":  "#ef4444",   # red    — lowest tier
-        None: "#94a3b8",   # grey   — no classification
+    _CAT_COLOR = {
+        "A": "#22c55e", "B1": "#4ade80", "B2": "#60a5fa",
+        "C1": "#f59e0b", "C2": "#fb923c", "D": "#ef4444", None: "#94a3b8",
     }
-    CAT_LABEL = {
+    _CAT_LABEL = {
         "A": "A — Elite", "B1": "B1 — Strong", "B2": "B2 — Solid",
         "C1": "C1 — Developing", "C2": "C2 — Below avg", "D": "D — Low performer",
         None: "Unclassified",
     }
-    # Render order: unclassified first (bottom), then D→A (A on top)
-    CAT_ORDER = [None, "D", "C2", "C1", "B2", "B1", "A"]
-    CAT_OPACITY = {None: 0.25, "D": 0.50, "C2": 0.50, "C1": 0.50, "B2": 0.55, "B1": 0.60, "A": 0.70}
-    CAT_RADIUS  = {None: 2,    "D": 3,    "C2": 3,    "C1": 3,    "B2": 3,    "B1": 3,    "A": 4}
+    _CAT_RENDER_ORDER = [None, "D", "C2", "C1", "B2", "B1", "A"]
+    _CAT_OPACITY = {None: 0.25, "D": 0.50, "C2": 0.50, "C1": 0.50, "B2": 0.55, "B1": 0.60, "A": 0.70}
+    _CAT_RADIUS  = {None: 2, "D": 3, "C2": 3, "C1": 3, "B2": 3, "B1": 3, "A": 4}
 
-    with st.spinner("Loading fleet pickup data — this may take a moment..."):
-        raw_all = db.load_all_driver_coords(sample_per_driver=60, days_back=30)
+    _cat_df  = pd.read_csv(_CAT_PATH)
+    _cat_map = dict(zip(_cat_df["dim_driver_id"], _cat_df["category"]))
 
-    if raw_all.empty:
+    with st.spinner("Loading fleet pickup data..."):
+        _raw = db.load_all_driver_coords(sample_per_driver=60, days_back=30)
+
+    if _raw.empty:
         st.warning("No data returned.")
         st.stop()
 
-    raw_all["category"] = raw_all["dim_driver_id"].map(_cat_map)
-    raw_all["category"] = raw_all["category"].where(
-        raw_all["category"].isin(["A","B1","B2","C1","C2","D"]), other=None
-    )
+    _raw["category"] = _raw["dim_driver_id"].map(_cat_map)
+    _raw["category"] = _raw["category"].where(_raw["category"].isin(["A","B1","B2","C1","C2","D"]), other=None)
 
-    with st.spinner(f"Parsing coordinates for {raw_all['dim_driver_id'].nunique()} drivers..."):
-        coords = raw_all["pickup_lat_long"].apply(parse_dms)
-        raw_all["plat"] = [c[0] for c in coords]
-        raw_all["plon"] = [c[1] for c in coords]
+    with st.spinner("Parsing coordinates..."):
+        _coords = _raw["pickup_lat_long"].apply(parse_dms)
+        _raw["plat"] = [c[0] for c in _coords]
+        _raw["plon"] = [c[1] for c in _coords]
 
-    fleet = raw_all.dropna(subset=["plat","plon"])
-    fleet = fleet[fleet["plat"].between(51.3, 51.7) & fleet["plon"].between(-0.55, 0.3)]
+    _fleet = _raw.dropna(subset=["plat","plon"])
+    _fleet = _fleet[_fleet["plat"].between(51.3,51.7) & _fleet["plon"].between(-0.55,0.3)]
 
-    n_drivers = fleet["dim_driver_id"].nunique()
-    n_points  = len(fleet)
+    _n_drivers = _fleet["dim_driver_id"].nunique()
+    _n_points  = len(_fleet)
 
-    # Category driver counts for metrics
-    cat_counts = fleet.groupby("category", dropna=False)["dim_driver_id"].nunique()
+    # Category counts
+    _cat_counts = _fleet.groupby("category", dropna=False)["dim_driver_id"].nunique()
     _mc = st.columns(7)
     for i, cat in enumerate(["A","B1","B2","C1","C2","D",None]):
-        _mc[i].metric(
-            CAT_LABEL[cat].split(" — ")[0],
-            cat_counts.get(cat, 0),
-            delta=None,
-            help=CAT_LABEL[cat],
-        )
+        _mc[i].metric(_CAT_LABEL[cat].split(" — ")[0], _cat_counts.get(cat, 0), help=_CAT_LABEL[cat])
 
-    # ── Map ───────────────────────────────────────────────────────────────────
-    m = folium.Map(location=[51.505, -0.13], zoom_start=11, tiles="CartoDB dark_matter")
+    # Driver filter
+    st.divider()
+    _all_driver_names = sorted(
+        _fleet.drop_duplicates("dim_driver_id")
+        .apply(lambda r: DRIVER_NAMES.get(r["dim_driver_id"], r["driver_full_name"]), axis=1)
+    )
+    _sel_drivers = st.multiselect("Highlight specific drivers (empty = all)", options=_all_driver_names)
 
-    folium.GeoJson(
-        GEOJSON_DATA,
-        style_function=lambda f: {
-            "fillColor": "#ffffff", "fillOpacity": 0.03,
-            "color": "#555555", "weight": 1,
+    if _sel_drivers:
+        _did_set = {
+            r["dim_driver_id"]
+            for _, r in _fleet.drop_duplicates("dim_driver_id").iterrows()
+            if DRIVER_NAMES.get(r["dim_driver_id"], r["driver_full_name"]) in _sel_drivers
         }
-    ).add_to(m)
+        _fleet_map = _fleet[_fleet["dim_driver_id"].isin(_did_set)]
+        st.caption(f"Showing {len(_sel_drivers)} selected driver(s) · {len(_fleet_map):,} points")
+    else:
+        _fleet_map = _fleet
+        st.caption(f"Showing all {_n_drivers} drivers · {_n_points:,} pickup points")
 
-    folium.Marker(
-        [51.51, _WEST_LON],
-        icon=folium.DivIcon(
-            html='<div style="color:#facc15;font-size:11px;white-space:nowrap;'
-                 'font-weight:bold;text-shadow:0 0 4px #000;">← West | East →</div>',
-            icon_size=(110, 20), icon_anchor=(55, 10),
-        ),
-        tooltip="High-demand corridor boundary"
-    ).add_to(m)
+    # Folium map
+    _m = folium.Map(location=[51.505, -0.13], zoom_start=11, tiles="CartoDB positron")
+    folium.GeoJson(GEOJSON_DATA, style_function=lambda f: {
+        "fillColor": "#e2e8f0", "fillOpacity": 0.08, "color": "#94a3b8", "weight": 1
+    }).add_to(_m)
+    folium.Marker([51.51, _WEST_LON], icon=folium.DivIcon(
+        html='<div style="color:#1e40af;font-size:11px;white-space:nowrap;font-weight:bold;">← West | East →</div>',
+        icon_size=(110, 20), icon_anchor=(55, 10),
+    ), tooltip="High-demand corridor boundary").add_to(_m)
 
-    for cat in CAT_ORDER:
-        subset  = fleet[fleet["category"] == cat] if cat is not None else fleet[fleet["category"].isna()]
-        colour  = CAT_COLOR[cat]
-        opacity = CAT_OPACITY[cat]
-        radius  = CAT_RADIUS[cat]
-        for _, row in subset.iterrows():
+    for cat in _CAT_RENDER_ORDER:
+        _sub = _fleet_map[_fleet_map["category"] == cat] if cat is not None else _fleet_map[_fleet_map["category"].isna()]
+        for _, row in _sub.iterrows():
             folium.CircleMarker(
-                [row["plat"], row["plon"]],
-                radius=radius,
-                color=colour, fill=True, fill_color=colour,
-                fill_opacity=opacity, weight=0,
-                tooltip=f"{row['driver_full_name']} · {CAT_LABEL[cat]}",
-            ).add_to(m)
+                [row["plat"], row["plon"]], radius=_CAT_RADIUS[cat],
+                color=_CAT_COLOR[cat], fill=True, fill_color=_CAT_COLOR[cat],
+                fill_opacity=_CAT_OPACITY[cat], weight=0,
+                tooltip=f"{row['driver_full_name']} · {_CAT_LABEL[cat]}",
+            ).add_to(_m)
 
-    st_folium(m, width="100%", height=580, returned_objects=[])
+    st_folium(_m, width="100%", height=580, returned_objects=[])
 
-    # ── Legend ────────────────────────────────────────────────────────────────
-    _legend_items = "".join(
-        f'<span style="margin-right:20px;">'
-        f'<span style="color:{CAT_COLOR[c]};font-size:16px;">●</span> {CAT_LABEL[c]}'
-        f'</span>'
+    # Legend
+    _legend = "".join(
+        f'<span style="margin-right:20px;"><span style="color:{_CAT_COLOR[c]};font-size:16px;">●</span> {_CAT_LABEL[c]}</span>'
         for c in ["A","B1","B2","C1","C2","D",None]
     )
-    st.markdown(
-        f'<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;">{_legend_items}'
-        f'<span style="margin-left:12px;color:#94a3b8;font-size:13px;">┃</span>'
-        f'<span style="color:#facc15;font-size:13px;margin-left:8px;">━━ West boundary (-0.12°)</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-    st.caption(f"{n_points:,} pickup points plotted across {n_drivers} drivers · last 30 days · up to 60 pickups per driver")
+    st.markdown(f'<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;">{_legend}</div>', unsafe_allow_html=True)
 
-    # ── West % by category ────────────────────────────────────────────────────
+    # West % analysis
     st.divider()
     st.subheader("West London pickup % by category")
-    st.caption("% of each driver's pickups that fall west of -0.12° longitude (Charing Cross line)")
+    st.caption("% of each driver's pickups west of −0.12° (Charing Cross line)")
 
-    west_rows = []
-    for _, grp in fleet.groupby("dim_driver_id"):
-        did  = grp["dim_driver_id"].iloc[0]
-        cat  = grp["category"].iloc[0] if pd.notna(grp["category"].iloc[0]) else None
-        lons = grp["plon"].dropna()
-        west_pct = (lons < _WEST_LON).mean() * 100
-        west_rows.append({
-            "Driver":   DRIVER_NAMES.get(did, grp["driver_full_name"].iloc[0]),
-            "Category": cat if cat else "—",
-            "Label":    CAT_LABEL[cat],
-            "West %":   round(west_pct, 1),
-            "Pickups":  len(lons),
+    _west_rows = []
+    for _, _grp in _fleet_map.groupby("dim_driver_id"):
+        _did = _grp["dim_driver_id"].iloc[0]
+        _cat = _grp["category"].iloc[0] if pd.notna(_grp["category"].iloc[0]) else None
+        _lons = _grp["plon"].dropna()
+        _west_rows.append({
+            "Driver":   DRIVER_NAMES.get(_did, _grp["driver_full_name"].iloc[0]),
+            "Category": _cat if _cat else "—",
+            "West %":   round((_lons < _WEST_LON).mean() * 100, 1),
+            "Pickups":  len(_lons),
         })
+    _west_df = pd.DataFrame(_west_rows)
+    _csort = ["A","B1","B2","C1","C2","D","—"]
+    _west_df["_s"] = _west_df["Category"].map({c:i for i,c in enumerate(_csort)})
+    _west_df = _west_df.sort_values(["_s","West %"], ascending=[True,False]).drop(columns="_s")
 
-    west_df = pd.DataFrame(west_rows).sort_values(["Category","West %"], ascending=[True, False])
+    # Summary table
+    _summ = (_west_df.groupby("Category")["West %"]
+             .agg(Drivers="count", Mean="mean", Median="median", Min="min", Max="max")
+             .round(1).reset_index())
+    _summ["_s"] = _summ["Category"].map({c:i for i,c in enumerate(_csort)})
+    _summ = _summ.sort_values("_s").drop(columns="_s")
+    st.dataframe(_summ, use_container_width=True, hide_index=True)
 
-    # Summary table by category
-    grp_summary = (
-        west_df.groupby("Category")["West %"]
-        .agg(["mean","median","min","max"])
-        .round(1)
-        .reset_index()
-        .rename(columns={"mean":"Avg %","median":"Median %","min":"Min %","max":"Max %"})
-    )
-    # Sort by category order
-    _cat_order_str = ["A","B1","B2","C1","C2","D","—"]
-    grp_summary["_sort"] = grp_summary["Category"].map({c:i for i,c in enumerate(_cat_order_str)})
-    grp_summary = grp_summary.sort_values("_sort").drop(columns="_sort")
-    st.dataframe(grp_summary, use_container_width=True, hide_index=True)
+    # Bar chart
+    _disc = {c: _CAT_COLOR.get(c if c != "—" else None, "#94a3b8") for c in _csort}
+    _fig_all = px.bar(_west_df, x="West %", y="Driver", orientation="h",
+                      color="Category", color_discrete_map=_disc, text="West %",
+                      title="West London pickup % — all drivers",
+                      height=max(500, len(_west_df) * 22 + 80))
+    _fig_all.add_vline(x=50, line_dash="dash", line_color="#94a3b8", annotation_text="50%", annotation_position="top")
+    _fig_all.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+    _fig_all.update_layout(xaxis_title="% pickups west of −0.12°", yaxis={"categoryorder": "total ascending"})
+    st.plotly_chart(_fig_all, use_container_width=True)
 
-    # Bar chart — sorted by west % within each category
-    west_df_sorted = west_df.sort_values(["Category","West %"], ascending=[True,False])
-    _disc_map = {cat: CAT_COLOR[cat if cat != "—" else None] for cat in _cat_order_str}
-    fig_all = px.bar(
-        west_df_sorted, x="West %", y="Driver", orientation="h",
-        color="Category",
-        color_discrete_map=_disc_map,
-        text="West %",
-        title="West London pickup % — all drivers (grouped by category)",
-        height=max(500, len(west_df_sorted) * 22 + 80),
-    )
-    fig_all.add_vline(x=50, line_dash="dash", line_color="#94a3b8",
-                      annotation_text="50%", annotation_position="top")
-    fig_all.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-    fig_all.update_layout(xaxis_title="% of pickups west of -0.12°", yaxis={"categoryorder": "total ascending"})
-    st.plotly_chart(fig_all, use_container_width=True)
-
-    # ── Narrative ─────────────────────────────────────────────────────────────
-    _a_avg  = west_df[west_df["Category"] == "A"]["West %"].mean() if "A" in west_df["Category"].values else 0
-    _d_avg  = west_df[west_df["Category"] == "D"]["West %"].mean() if "D" in west_df["Category"].values else 0
-    _all_avg = west_df["West %"].mean()
-
+    # Narrative
+    _a_avg = _west_df[_west_df["Category"] == "A"]["West %"].mean() if "A" in _west_df["Category"].values else 0
+    _d_avg = _west_df[_west_df["Category"] == "D"]["West %"].mean() if "D" in _west_df["Category"].values else 0
+    _all_avg = _west_df["West %"].mean()
     st.markdown(
-        f'<div style="background:#1e1e2e;border-left:4px solid #22c55e;'
-        f'padding:14px 16px;border-radius:6px;color:#e2e8f0;margin-top:8px;">'
-        f'<strong>📍 Fleet positioning by category:</strong><br><br>'
-        f'<span style="color:#22c55e;">●</span> <strong>Cat A avg: {_a_avg:.1f}%</strong> west — elite drivers cluster in the high-demand corridor<br>'
-        f'<span style="color:#ef4444;">●</span> <strong>Cat D avg: {_d_avg:.1f}%</strong> west — '
-        f'<strong>{_a_avg - _d_avg:.1f}pp below Cat A</strong><br>'
-        f'<span style="color:#94a3b8;">●</span> Fleet overall: <strong>{_all_avg:.1f}%</strong><br><br>'
-        f'Positioning west of -0.12° correlates strongly with higher ping density and shorter dead miles. '
-        f'Cat D drivers consistently drift east/northeast where demand is lower — this compounds '
-        f'over a shift into materially worse RPH before accounting for trip selection.'
+        f'<div style="background:#1e1e2e;border-left:4px solid #22c55e;padding:14px 16px;'
+        f'border-radius:6px;color:#e2e8f0;margin-top:8px;">'
+        f'<strong>Fleet positioning by category:</strong><br><br>'
+        f'<span style="color:#22c55e;">●</span> <strong>Cat A avg: {_a_avg:.1f}%</strong> west<br>'
+        f'<span style="color:#ef4444;">●</span> <strong>Cat D avg: {_d_avg:.1f}%</strong> west '
+        f'(<strong>{_a_avg - _d_avg:.1f}pp below Cat A</strong>)<br>'
+        f'<span style="color:#94a3b8;">●</span> Fleet overall: <strong>{_all_avg:.1f}%</strong>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-# ── Driver Day ───────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DRIVER DAY
+# ═══════════════════════════════════════════════════════════════════════════════
 elif page == "Driver Day":
     st.title("Driver Day")
-    st.caption("Pick any driver and a date — see every trip they took, every ping they dropped, and how their earnings built through the shift.")
+    st.caption("Pick any driver and a date — every trip, every declined ping, earnings through the shift.")
 
-    # ── Driver search ─────────────────────────────────────────────────────────
-    col_srch, col_date = st.columns([2, 1])
-    with col_srch:
-        _dd_search = st.text_input(
-            "Search driver by name",
-            placeholder="e.g. Yousuf, Mukhtar, Monier...",
-            key="dd_search",
-        )
+    _col_srch, _col_date = st.columns([2, 1])
+    with _col_srch:
+        _dd_search = st.text_input("Search driver by name",
+                                   placeholder="e.g. Yousuf, Mukhtar, Monier...",
+                                   key="dd_search")
 
     if not _dd_search or len(_dd_search) < 2:
         st.info("Type at least 2 characters to search for a driver.")
         st.stop()
 
     with st.spinner("Searching..."):
-        _dd_results = db.search_drivers(_dd_search)
+        _dd_results = _search_drivers(_dd_search)
 
     if _dd_results.empty:
         st.warning(f"No drivers found matching '{_dd_search}'.")
@@ -1266,3273 +1113,1205 @@ elif page == "Driver Day":
     _dd_opts = {f"{row.driver_full_name} (ID {row.dim_driver_id})": int(row.dim_driver_id)
                 for _, row in _dd_results.iterrows()}
 
-    with col_srch:
-        _dd_label  = st.selectbox("Select driver", options=list(_dd_opts.keys()), key="dd_select")
-        driver_id  = _dd_opts[_dd_label]
+    with _col_srch:
+        _dd_label = st.selectbox("Select driver", options=list(_dd_opts.keys()), key="dd_select")
+        _driver_id = _dd_opts[_dd_label]
 
-    # ── Load trips for selected driver ────────────────────────────────────────
-    with st.spinner(f"Loading trips for {_dd_label}..."):
-        raw = db.load_any_driver_trips(driver_id)
+    with st.spinner(f"Loading trips..."):
+        _dd_raw = db.load_any_driver_trips(_driver_id)
 
-    if raw.empty:
-        st.warning("No completed trips found for this driver.")
-        st.stop()
+    _today = pd.Timestamp.now().date()
 
-    enriched = enrich_zones(raw)
-    enriched = calc_true_rph(enriched)
-    enriched["pickedup_trip_datetime"] = pd.to_datetime(enriched["pickedup_trip_datetime"])
-    enriched["dropoff_trip_datetime"]  = pd.to_datetime(enriched["dropoff_trip_datetime"])
-    enriched["trip_date"] = enriched["pickedup_trip_datetime"].dt.date
-
-    driver_trips    = enriched.copy()
-    available_dates = sorted(driver_trips["trip_date"].dropna().unique(), reverse=True)
-
-    with col_date:
-        selected_date = st.selectbox("Date", options=[str(d) for d in available_dates])
-
-    day_trips = (
-        driver_trips[driver_trips["trip_date"] == pd.Timestamp(selected_date).date()]
-        .sort_values("pickedup_trip_datetime")
-        .reset_index(drop=True)
-    )
-    day_trips["trip_num"] = range(1, len(day_trips) + 1)
-
-    if day_trips.empty:
-        st.warning("No completed trips found for this driver on this date.")
-        st.stop()
-
-    # ── Load declined pings ───────────────────────────────────────────────────
-    with st.spinner("Loading declined pings..."):
-        declined_raw = db.load_driver_declined_day(driver_id, selected_date)
-
-    if not declined_raw.empty:
-        dec_coords = declined_raw["pickup_lat_long"].apply(parse_dms)
-        declined_raw["plat"] = [c[0] for c in dec_coords]
-        declined_raw["plon"] = [c[1] for c in dec_coords]
-        declined_day = declined_raw.dropna(subset=["plat", "plon"])
+    if _dd_raw.empty:
+        _driver_trips = pd.DataFrame()
+        _avail_dates  = []
     else:
-        declined_day = pd.DataFrame()
+        _enriched = enrich_zones(_dd_raw)
+        _enriched = calc_true_rph(_enriched)
+        _enriched["pickedup_trip_datetime"] = pd.to_datetime(_enriched["pickedup_trip_datetime"])
+        _enriched["dropoff_trip_datetime"]  = pd.to_datetime(_enriched["dropoff_trip_datetime"])
+        _enriched["trip_date"] = _enriched["pickedup_trip_datetime"].dt.date
+        _driver_trips = _enriched.copy()
+        _avail_dates  = sorted(_driver_trips["trip_date"].dropna().unique(), reverse=True)
 
-    n_declined = len(declined_day)
+    if _today not in _avail_dates:
+        _avail_dates = [_today] + list(_avail_dates)
 
-    # ── Stats strip ───────────────────────────────────────────────────────────
-    total_fare = day_trips["trip_price_in_pound"].sum()
-    n_trips    = len(day_trips)
-    day_rph    = day_trips["true_rph"].replace([np.inf, -np.inf], np.nan).median()
-    accept_pct = round(n_trips / max(n_trips + n_declined, 1) * 100)
+    _date_strs   = [str(d) for d in _avail_dates]
+    _default_idx = 1 if len(_date_strs) > 1 and str(_today) == _date_strs[0] else 0
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Trips taken",     n_trips)
-    c2.metric("Pings dropped",   n_declined)
-    c3.metric("Day earnings",    f"£{total_fare:.2f}")
-    c4.metric("Acceptance (day)",f"{accept_pct}%",  f"Fleet avg 57%")
+    with _col_date:
+        _sel_date = st.selectbox("Date", options=_date_strs, index=_default_idx)
+
+    if not _driver_trips.empty:
+        _day_trips = (
+            _driver_trips[_driver_trips["trip_date"] == pd.Timestamp(_sel_date).date()]
+            .sort_values("pickedup_trip_datetime")
+            .reset_index(drop=True)
+        )
+        _day_trips["trip_num"] = range(1, len(_day_trips) + 1)
+    else:
+        _day_trips = pd.DataFrame()
+
+    _has_trips = not _day_trips.empty
+
+    # Declined pings
+    with st.spinner("Loading declined pings..."):
+        _dec_raw = db.load_driver_declined_day(_driver_id, _sel_date)
+
+    if not _dec_raw.empty:
+        _dec_coords = _dec_raw["pickup_lat_long"].apply(parse_dms)
+        _dec_raw["plat"] = [c[0] for c in _dec_coords]
+        _dec_raw["plon"] = [c[1] for c in _dec_coords]
+        _dec_day = _dec_raw.dropna(subset=["plat","plon"])
+    else:
+        _dec_day = pd.DataFrame()
+
+    _n_dec = len(_dec_day)
+
+    # Stats strip
+    _total_fare = _day_trips["trip_price_in_pound"].sum() if _has_trips else 0
+    _n_trips    = len(_day_trips)
+    _day_rph    = _day_trips["true_rph"].replace([np.inf,-np.inf], np.nan).median() if _has_trips else None
+    _accept_pct = round(_n_trips / max(_n_trips + _n_dec, 1) * 100)
+
+    _sc1, _sc2, _sc3, _sc4 = st.columns(4)
+    _sc1.metric("Trips completed", _n_trips)
+    _sc2.metric("Total earnings",  f"£{_total_fare:.2f}")
+    _sc3.metric("Median RPH",      f"£{_day_rph:.2f}" if _day_rph else "—")
+    _sc4.metric("Accept rate",     f"{_accept_pct}%", f"{_n_dec} declined")
+
+    st.divider()
+
+    if not _has_trips:
+        st.info(f"No completed trips found for {_sel_date}.")
+        if not _dec_day.empty:
+            st.markdown(f"Found **{_n_dec} declined pings** on this date.")
+        st.stop()
 
     # ── Map ───────────────────────────────────────────────────────────────────
     st.subheader("Trip map")
-    st.caption("Numbered markers = trips in order. Red dots = declined pings. Hover for details.")
 
-    map_center = [
-        day_trips["pickup_lat"].dropna().iloc[0] if day_trips["pickup_lat"].notna().any() else CENTER_LAT,
-        day_trips["pickup_lon"].dropna().iloc[0] if day_trips["pickup_lon"].notna().any() else CENTER_LON,
-    ]
-    m = folium.Map(location=map_center, zoom_start=12, tiles="CartoDB dark_matter")
+    _m_day = folium.Map(location=[CENTER_LAT, CENTER_LON], zoom_start=11, tiles="CartoDB positron")
+    folium.GeoJson(GEOJSON_DATA, style_function=lambda f: {
+        "fillColor": "#e2e8f0", "fillOpacity": 0.08, "color": "#94a3b8", "weight": 1,
+    }).add_to(_m_day)
 
-    folium.GeoJson(
-        GEOJSON_DATA,
-        style_function=lambda f: {
-            "fillColor": "#ffffff", "fillOpacity": 0.03,
-            "color": "#666666", "weight": 1,
-        }
-    ).add_to(m)
+    # Plot trips
+    for _, row in _day_trips.iterrows():
+        _pc = parse_dms(str(row.get("pickup_lat_long", "") or ""))
+        _dc = parse_dms(str(row.get("dropoff_latlong", "") or ""))
+        if _pc[0] and _dc[0]:
+            folium.CircleMarker(
+                [_pc[0], _pc[1]], radius=6, color="#22c55e", fill=True, fill_opacity=0.8, weight=0,
+                tooltip=f"Trip {row['trip_num']}: pickup · £{row['trip_price_in_pound']:.2f}",
+            ).add_to(_m_day)
+            folium.CircleMarker(
+                [_dc[0], _dc[1]], radius=6, color="#ef4444", fill=True, fill_opacity=0.8, weight=0,
+                tooltip=f"Trip {row['trip_num']}: dropoff · Zone {row.get('dropoff_zone','')}",
+            ).add_to(_m_day)
+            folium.PolyLine([[_pc[0],_pc[1]], [_dc[0],_dc[1]]],
+                            color="#6366f1", weight=1.5, opacity=0.5).add_to(_m_day)
 
-    TRIP_PALETTE = [
-        "#60a5fa","#34d399","#f59e0b","#a78bfa","#f87171",
-        "#38bdf8","#4ade80","#fb923c","#c084fc","#fb7185",
-    ]
-
-    for _, row in day_trips.iterrows():
-        if pd.isna(row.get("pickup_lat")) or pd.isna(row.get("dropoff_lat")):
-            continue
-        color = TRIP_PALETTE[(row["trip_num"] - 1) % len(TRIP_PALETTE)]
-        pz    = int(row["pickup_zone"])  if pd.notna(row.get("pickup_zone"))  else "?"
-        dz    = int(row["dropoff_zone"]) if pd.notna(row.get("dropoff_zone")) else "?"
-        tip   = (f"Trip {row['trip_num']} | {row['pickedup_trip_datetime'].strftime('%H:%M')} | "
-                 f"£{row['trip_price_in_pound']:.2f} | {row['distance_in_miles']:.1f}mi | Z{pz}→Z{dz}")
-
-        folium.PolyLine(
-            [(row["pickup_lat"], row["pickup_lon"]),
-             (row["dropoff_lat"], row["dropoff_lon"])],
-            color=color, weight=3, opacity=0.85, tooltip=tip,
-        ).add_to(m)
-
-        folium.Marker(
-            [row["pickup_lat"], row["pickup_lon"]],
-            icon=folium.DivIcon(
-                html=(f'<div style="background:{color};color:#111;border-radius:50%;'
-                      f'width:20px;height:20px;display:flex;align-items:center;'
-                      f'justify-content:center;font-weight:700;font-size:10px;">'
-                      f'{row["trip_num"]}</div>'),
-                icon_size=(20, 20), icon_anchor=(10, 10),
-            ),
-            tooltip=tip,
-        ).add_to(m)
-
+    # Declined pings
+    for _, row in _dec_day.iterrows():
         folium.CircleMarker(
-            [row["dropoff_lat"], row["dropoff_lon"]],
-            radius=4, color=color, fill=True, fill_opacity=0.5,
-            tooltip=f"Dropoff {row['trip_num']}",
-        ).add_to(m)
+            [row["plat"], row["plon"]], radius=4, color="#f59e0b", fill=True, fill_opacity=0.5, weight=0,
+            tooltip=f"Declined · £{row.get('trip_price_in_pound', 0):.2f}",
+        ).add_to(_m_day)
 
-    for _, row in declined_day.iterrows():
-        folium.CircleMarker(
-            [row["plat"], row["plon"]],
-            radius=5, color="#ef4444", fill=True, fill_color="#ef4444",
-            fill_opacity=0.75, weight=1,
-            tooltip="Declined ping",
-        ).add_to(m)
-
-    st_folium(m, width="100%", height=520, returned_objects=[])
+    st_folium(_m_day, width="100%", height=500, returned_objects=[])
+    st.caption("🟢 Pickup  🔴 Dropoff  🟡 Declined ping  🟣 Route")
 
     # ── Timeline ──────────────────────────────────────────────────────────────
-    st.subheader("Timeline")
+    st.divider()
+    st.subheader("Trip timeline")
 
-    tl_rows = []
-    for _, row in day_trips.iterrows():
-        pz = int(row["pickup_zone"])  if pd.notna(row.get("pickup_zone"))  else 0
-        dz = int(row["dropoff_zone"]) if pd.notna(row.get("dropoff_zone")) else 0
-        tl_rows.append({
-            "Trip": f"Trip {row['trip_num']:02d}  Z{pz}→Z{dz}",
-            "Start": row["pickedup_trip_datetime"],
-            "End":   row["dropoff_trip_datetime"],
-            "Fare £": row["trip_price_in_pound"],
-            "RPH":    round(row["true_rph"], 2) if pd.notna(row.get("true_rph")) else None,
-            "Platform": row.get("source", ""),
-        })
-
-    tl_df = pd.DataFrame(tl_rows)
-    fig_tl = px.timeline(
-        tl_df, x_start="Start", x_end="End", y="Trip",
-        color="Fare £", color_continuous_scale="Greens",
-        hover_data=["Fare £", "RPH", "Platform"],
-        title=f"{driver_label} — {selected_date}",
+    _tl_df = _day_trips.copy()
+    _tl_df["start"] = _tl_df["pickedup_trip_datetime"]
+    _tl_df["end"]   = _tl_df["dropoff_trip_datetime"]
+    _tl_df["label"] = _tl_df.apply(
+        lambda r: f"Trip {r['trip_num']} · £{r['trip_price_in_pound']:.2f} · Z{r.get('pickup_zone','')}→Z{r.get('dropoff_zone','')}",
+        axis=1,
     )
-    fig_tl.update_yaxes(autorange="reversed")
-    fig_tl.update_layout(height=max(320, n_trips * 32 + 80))
-    st.plotly_chart(fig_tl, use_container_width=True)
 
-    # ── Earnings & RPH curve ──────────────────────────────────────────────────
-    st.subheader("Earnings curve")
+    _fig_tl = px.timeline(
+        _tl_df, x_start="start", x_end="end", y="label",
+        color="trip_price_in_pound",
+        color_continuous_scale="RdYlGn",
+        title=f"Trip timeline — {_sel_date}",
+        labels={"trip_price_in_pound": "Fare £"},
+        height=max(300, _n_trips * 40 + 80),
+    )
+    _fig_tl.update_xaxes(tickformat="%H:%M")
+    _fig_tl.update_layout(yaxis_title="", coloraxis_colorbar_title="Fare £", showlegend=False)
+    st.plotly_chart(_fig_tl, use_container_width=True)
 
-    day_trips["cumulative"] = day_trips["trip_price_in_pound"].cumsum()
+    # ── Earnings curve ────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Earnings through the shift")
 
-    fig_earn = go.Figure()
-    fig_earn.add_trace(go.Scatter(
-        x=day_trips["pickedup_trip_datetime"],
-        y=day_trips["cumulative"],
-        mode="lines+markers",
+    _earn_df = _day_trips.copy()
+    _earn_df["cumulative"] = _earn_df["trip_price_in_pound"].cumsum()
+    _earn_df["time"]       = _earn_df["dropoff_trip_datetime"]
+
+    _fig_earn = go.Figure()
+    _fig_earn.add_trace(go.Scatter(
+        x=_earn_df["time"], y=_earn_df["cumulative"],
+        mode="lines+markers+text",
         line=dict(color="#22c55e", width=2),
-        marker=dict(size=7),
+        marker=dict(size=8, color="#22c55e"),
+        text=[f"£{v:.0f}" for v in _earn_df["cumulative"]],
+        textposition="top center",
         name="Cumulative earnings",
-        hovertemplate="<b>%{x|%H:%M}</b><br>Total: £%{y:.2f}<extra></extra>",
     ))
-    fig_earn.add_trace(go.Scatter(
-        x=day_trips["pickedup_trip_datetime"],
-        y=day_trips["true_rph"],
-        mode="lines+markers",
-        line=dict(color="#f59e0b", width=2, dash="dot"),
-        marker=dict(size=6),
-        name="Trip RPH",
-        yaxis="y2",
-        hovertemplate="<b>%{x|%H:%M}</b><br>RPH: £%{y:.2f}/hr<extra></extra>",
-    ))
-    fig_earn.add_hline(y=22.9, line_dash="dash", line_color="rgba(255,255,255,0.3)",
-                       annotation_text="Fleet avg £22.9/hr", yref="y2",
-                       annotation_position="bottom right")
-    fig_earn.update_layout(
-        height=320,
-        yaxis=dict(title="Cumulative £", side="left"),
-        yaxis2=dict(title="Trip RPH £/hr", side="right", overlaying="y"),
-        legend=dict(x=0.01, y=0.99),
-        hovermode="x unified",
+    _fig_earn.update_layout(
+        title=f"Cumulative earnings — {_sel_date}",
+        xaxis_title="Time", yaxis_title="£ earned",
+        xaxis=dict(tickformat="%H:%M"),
+        height=360,
     )
-    st.plotly_chart(fig_earn, use_container_width=True)
+    st.plotly_chart(_fig_earn, use_container_width=True)
 
     # ── Trip table ────────────────────────────────────────────────────────────
     with st.expander("Full trip table"):
-        disp = day_trips[[
-            "trip_num","pickedup_trip_datetime","trip_price_in_pound",
-            "distance_in_miles","pob_duration_in_min","pickup_duration_in_min",
-            "pickup_zone","dropoff_zone","true_rph","source",
+        _tbl = _day_trips[[
+            "trip_num", "pickedup_trip_datetime", "dropoff_trip_datetime",
+            "trip_price_in_pound", "pickup_zone", "dropoff_zone", "true_rph",
         ]].copy()
-        disp.columns = ["#","Time","Fare £","Miles","Ride min","Pickup min",
-                        "From Z","To Z","RPH","Platform"]
-        disp["Time"]    = disp["Time"].dt.strftime("%H:%M")
-        disp["From Z"]  = disp["From Z"].astype(int)
-        disp["To Z"]    = disp["To Z"].astype(int)
-        st.dataframe(disp, use_container_width=True, hide_index=True)
+        _tbl.columns = ["#", "Pickup time", "Dropoff time", "Fare £", "Pickup zone", "Dropoff zone", "True RPH"]
+        _tbl["Pickup time"]  = _tbl["Pickup time"].dt.strftime("%H:%M")
+        _tbl["Dropoff time"] = _tbl["Dropoff time"].dt.strftime("%H:%M")
+        _tbl["Fare £"]    = _tbl["Fare £"].round(2)
+        _tbl["True RPH"]  = _tbl["True RPH"].replace([np.inf,-np.inf], np.nan).round(2)
+        st.dataframe(_tbl, use_container_width=True, hide_index=True)
 
-# ── Gap Analysis ─────────────────────────────────────────────────────────────
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GAP ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════════
 elif page == "Gap Analysis":
-    _GAP_GOOD  = (128, 81, 130, 180, 155)
-    _GAP_BAD   = (82, 178, 72, 36, 32)
-    _GAP_IDS   = _GAP_GOOD + _GAP_BAD
-    _GAP_NAMES = {
-        128: "Monier Janabi",
-        81:  "Marius Norvaisas",
-        130: "Jermaine Gyamfi",
-        180: "Abdi Mohamed",
-        155: "Ertac Cindoglu",
-        82:  "Aaron Bartley",
-        178: "Abdullahi Saleh",
-        72:  "Ponki Miah",
-        36:  "Angeline Lewis",
-        32:  "Emran Uddin",
-    }
-    # Heathrow bounding box — dropoffs here are queue-related, not decision problems
-    _LHR_LAT = (51.45, 51.49)
-    _LHR_LON = (-0.50, -0.42)
-    _GAP_MINS  = 25           # minimum gap to investigate (below = normal inter-trip wait)
-    _GAP_MAX   = 75           # above this = driver likely on break, app off
-    _GAP_ZONE  = 3            # minimum dropoff zone to count as "stranded"
-
     st.title("Gap Analysis")
-    st.caption(
-        "When a driver ends up stranded in an outer zone and sits for 25+ minutes — "
-        "what pings came in during that wait? Did they have a good option they passed on, "
-        "or was there genuinely nothing worth taking?"
-    )
-    st.info(
-        f"5 top performers + 5 comparison drivers · last 14 days · "
-        f"gaps {_GAP_MINS}–{_GAP_MAX} min after a Zone {_GAP_ZONE}+ dropoff · "
-        f"gaps over {_GAP_MAX} min excluded (assumed break)"
-    )
+    st.caption("Find when drivers get stuck, where they were stranded, and what high-value pings they passed on.")
 
-    # ── Load data ─────────────────────────────────────────────────────────────
-    with st.spinner("Loading accepted trips..."):
-        acc_raw = db.load_gap_accepted(_GAP_IDS, days_back=14)
-    with st.spinner("Loading declined pings..."):
-        dec_raw = db.load_gap_declined(_GAP_IDS, days_back=14)
+    _LHR = {"lat": (51.45, 51.49), "lon": (-0.50, -0.42)}
+    _LGW = {"lat": (51.13, 51.18), "lon": (-0.22, -0.14)}
 
-    # Parse & enrich accepted
-    if acc_raw.empty:
-        st.warning("No accepted trips found in the last 14 days for these drivers.")
-        st.stop()
+    def _is_airport(lat, lon):
+        if lat is None or lon is None:
+            return None
+        if _LHR["lat"][0] <= lat <= _LHR["lat"][1] and _LHR["lon"][0] <= lon <= _LHR["lon"][1]:
+            return "Heathrow"
+        if _LGW["lat"][0] <= lat <= _LGW["lat"][1] and _LGW["lon"][0] <= lon <= _LGW["lon"][1]:
+            return "Gatwick"
+        return None
 
-    acc = enrich_zones(acc_raw)
-    acc = calc_true_rph(acc)
-    acc["pickedup_trip_datetime"] = pd.to_datetime(acc["pickedup_trip_datetime"])
-    acc["dropoff_trip_datetime"]  = pd.to_datetime(acc["dropoff_trip_datetime"])
-    acc["pickup_zone"]  = acc["pickup_zone"].astype("Int64")
-    acc["dropoff_zone"] = acc["dropoff_zone"].astype("Int64")
-
-    # Parse declined coords & zones
-    if not dec_raw.empty:
-        dec_raw["trip_booking_datetime"] = pd.to_datetime(dec_raw["trip_booking_datetime"])
-        _dp = dec_raw["pickup_lat_long"].apply(parse_dms)
-        _dd = dec_raw["dropoff_latlong"].apply(parse_dms)
-        dec_raw["plat"] = [c[0] for c in _dp]; dec_raw["plon"] = [c[1] for c in _dp]
-        dec_raw["dlat"] = [c[0] for c in _dd]; dec_raw["dlon"] = [c[1] for c in _dd]
-        dec_raw["pickup_zone"]  = dec_raw.apply(lambda r: assign_zone(r.plat,  r.plon), axis=1)
-        dec_raw["dropoff_zone"] = dec_raw.apply(lambda r: assign_zone(r.dlat,  r.dlon), axis=1)
-        dec_raw = dec_raw.dropna(subset=["plat", "plon"])
-    else:
-        dec_raw = pd.DataFrame()
-
-    # ── Gap finder ────────────────────────────────────────────────────────────
-    def _find_gaps(driver_id):
-        drv = acc[acc["dim_driver_id"] == driver_id].sort_values("pickedup_trip_datetime").reset_index(drop=True)
-        gaps = []
-        for i in range(len(drv) - 1):
-            curr      = drv.iloc[i]
-            nxt       = drv.iloc[i + 1]
-            dz        = curr["dropoff_zone"]
-            if pd.isna(dz) or int(dz) < _GAP_ZONE:
+    def _stuck_events(trips_df):
+        rows = []
+        if trips_df.empty or len(trips_df) < 2:
+            return pd.DataFrame(rows)
+        df = trips_df.copy()
+        df["pickedup_trip_datetime"] = pd.to_datetime(df["pickedup_trip_datetime"])
+        df["dropoff_trip_datetime"]  = pd.to_datetime(df["dropoff_trip_datetime"])
+        df = df.sort_values("pickedup_trip_datetime").reset_index(drop=True)
+        for i in range(1, len(df)):
+            prev = df.iloc[i - 1]
+            curr = df.iloc[i]
+            gap  = (curr["pickedup_trip_datetime"] - prev["dropoff_trip_datetime"]).total_seconds() / 60
+            if gap < 0:
                 continue
-            gap_mins  = (nxt["pickedup_trip_datetime"] - curr["dropoff_trip_datetime"]).total_seconds() / 60
-            if gap_mins < _GAP_MINS or gap_mins > _GAP_MAX:
-                continue
-            # Declined pings that arrived during this gap
-            if not dec_raw.empty:
-                mask = (
-                    (dec_raw["dim_driver_id"] == driver_id) &
-                    (dec_raw["trip_booking_datetime"] >= curr["dropoff_trip_datetime"]) &
-                    (dec_raw["trip_booking_datetime"] <= nxt["pickedup_trip_datetime"])
-                )
-                pings = dec_raw[mask].copy()
-            else:
-                pings = pd.DataFrame()
-            # Detect if stranded at Heathrow (queue problem, not a decision problem)
-            dlat = curr.get("dropoff_lat")
-            dlon = curr.get("dropoff_lon")
-            at_lhr = (
-                pd.notna(dlat) and pd.notna(dlon) and
-                _LHR_LAT[0] <= dlat <= _LHR_LAT[1] and
-                _LHR_LON[0] <= dlon <= _LHR_LON[1]
-            )
-            gaps.append({
-                "stranding":     curr,
-                "rescue":        nxt,
-                "gap_mins":      gap_mins,
-                "stranded_zone": int(dz),
-                "pings":         pings,
-                "at_lhr":        at_lhr,
+            dc      = parse_dms(str(prev.get("dropoff_latlong", "") or ""))
+            airport = _is_airport(dc[0], dc[1])
+            west    = (dc[1] is not None and dc[1] < _WEST_LON)
+            _npu    = parse_dms(str(curr.get("pickup_lat_long", "") or ""))
+            _ndo    = parse_dms(str(curr.get("dropoff_latlong", "") or ""))
+            rows.append({
+                "gap_mins":    round(gap, 1),
+                "stuck_from":  prev["dropoff_trip_datetime"],
+                "stuck_until": curr["pickedup_trip_datetime"],
+                "stuck_lat":   dc[0],
+                "stuck_lon":   dc[1],
+                "west":        west,
+                "airport":     airport,
+                "prev_fare":   float(prev.get("trip_price_in_pound", 0) or 0),
+                "next_fare":   float(curr.get("trip_price_in_pound", 0) or 0),
+                "next_pz":     assign_zone(_npu[0], _npu[1]),
+                "next_dz":     assign_zone(_ndo[0], _ndo[1]),
+                "bucket":      ("<25m" if gap < 25 else ("25-75m" if gap <= 75 else ">75m")),
             })
-        return gaps
+        return pd.DataFrame(rows)
 
-    # ── Ping classifier ───────────────────────────────────────────────────────
-    def _rate_rescue(rescue, gap_mins, stranded_zone):
-        """Score the trip that ended the gap 0–10, return (score, stars, label, detail)."""
-        pz   = int(rescue.get("pickup_zone")  or stranded_zone)
-        dz   = int(rescue.get("dropoff_zone") or pz)
-        fare = float(rescue.get("trip_price_in_pound") or 0)
-        ride = float(rescue.get("pob_duration_in_min") or 20)
-
-        # 1. Direction: how much did the zone improve?
-        zone_delta = pz - dz           # positive = heading toward city
-        if zone_delta >= 3:   dir_score = 4
-        elif zone_delta >= 2: dir_score = 3
-        elif zone_delta == 1: dir_score = 2
-        elif zone_delta == 0: dir_score = 1
-        else:                 dir_score = 0   # going further out
-
-        # 2. Fare: was it worth pulling over for?
-        if fare >= 30:   fare_score = 3
-        elif fare >= 18: fare_score = 2
-        elif fare >= 10: fare_score = 1
-        else:            fare_score = 0
-
-        # 3. Wait-adjusted RPH: fare / (gap + ride) — what did the patience cost?
-        total_mins = gap_mins + ride
-        wait_rph   = fare / (total_mins / 60) if total_mins > 0 else 0
-        if wait_rph >= 22:   rph_score = 3
-        elif wait_rph >= 15: rph_score = 2
-        elif wait_rph >= 10: rph_score = 1
-        else:                rph_score = 0
-
-        score = dir_score + fare_score + rph_score   # 0–10
-
-        if score >= 8:   stars, label = "★★★★★", "Worth the wait"
-        elif score >= 6: stars, label = "★★★★☆", "Good recovery"
-        elif score >= 4: stars, label = "★★★☆☆", "Decent"
-        elif score >= 2: stars, label = "★★☆☆☆", "Questionable"
-        else:            stars, label = "★☆☆☆☆", "Should've moved earlier"
-
-        detail = (f"Z{pz}→Z{dz} · £{fare:.2f} · "
-                  f"wait-adj RPH £{wait_rph:.0f}/hr · {score}/10")
-        return score, stars, label, detail
-
-    def _classify_ping(ping, stranded_zone):
-        dz = ping.get("dropoff_zone")
-        # Fare is null for declined trips — estimate from coords
-        fare_db = ping.get("trip_price_in_pound") or 0
-        if fare_db > 0:
-            fare = fare_db
+    def _classify_ping(fare, pickup_zone, dropoff_zone, pickup_west, dropoff_west):
+        # Primary signal: direction relative to city centre
+        # Inbound (lower zone at dropoff) = almost always worth taking
+        # Outbound (higher zone at dropoff) = needs progressively higher fare to justify
+        if pickup_zone and dropoff_zone:
+            pz, dz    = int(pickup_zone), int(dropoff_zone)
+            good_dest = dz <= 2 or dropoff_west      # drops in premium area
+            bad_dest  = dz >= 5 and not dropoff_west  # strands driver far out
+            zones_out = max(0, dz - pz)
+            if dz < pz or good_dest:
+                min_fare = 7          # inbound or great destination — take it
+            elif zones_out == 0:
+                min_fare = 11         # local — modest threshold
+            else:
+                min_fare = 12 + zones_out * 7  # outbound: +£7 each zone further out
+            if bad_dest:
+                min_fare += 7         # extra penalty for ending up stranded far out
         else:
-            _, fare = estimate_ping(
-                ping.get("plat"), ping.get("plon"),
-                ping.get("dlat"), ping.get("dlon"),
-            )
-            fare = fare or 0
+            # No zone data: fall back to west/east heuristic
+            min_fare = 8 if (pickup_west or dropoff_west) else 14
+        if fare >= min_fare:
+            return "Should accept"
+        if fare >= min_fare * 0.65:
+            return "Borderline"
+        return "Fine to decline"
 
-        if pd.isna(dz):
-            direction = "unknown"
-        elif int(dz) < stranded_zone - 1:
-            direction = "heading_in"
-        elif int(dz) <= stranded_zone:
-            direction = "lateral"
+    # ── PART 1: INDIVIDUAL DRIVER ─────────────────────────────────────────────
+    st.subheader("Driver stuck analysis")
+    st.caption("Select any driver to see their stuck events for a given week — where stranded, how long, what pings they passed on.")
+
+    _ga_c1, _ga_c2 = st.columns([2, 1])
+    with _ga_c1:
+        _ga_q = st.text_input("Search driver by name", placeholder="e.g. Yousuf, Marius, Emran...", key="ga_q")
+
+    if not _ga_q or len(_ga_q) < 2:
+        st.info("Type at least 2 characters to search for a driver.")
+    else:
+        with st.spinner("Searching..."):
+            _ga_res = _search_drivers(_ga_q)
+
+        if _ga_res.empty:
+            st.warning(f"No drivers found matching '{_ga_q}'.")
         else:
-            direction = "going_further"
+            _ga_opts = {f"{r.driver_full_name} (ID {r.dim_driver_id})": int(r.dim_driver_id)
+                        for _, r in _ga_res.iterrows()}
+            with _ga_c1:
+                _ga_lbl = st.selectbox("Select driver", list(_ga_opts.keys()), key="ga_sel")
+                _ga_did = _ga_opts[_ga_lbl]
 
-        if direction == "heading_in" and fare >= 10:
-            verdict = "⚠️ Questionable — heading back, decent fare"
-        elif direction == "heading_in" and fare < 10:
-            verdict = "✓ Understandable — right direction but too cheap"
-        elif direction == "lateral":
-            verdict = "~ Borderline — stays in same area"
-        elif direction == "going_further":
-            verdict = "✓ Right call — going even further out"
-        else:
-            verdict = "? Unknown"
-        return direction, verdict
+            _today_d = pd.Timestamp.now().date()
+            _week_opts = {
+                "Last 7 days":    (_today_d - pd.Timedelta(days=7),  _today_d),
+                "8-14 days ago":  (_today_d - pd.Timedelta(days=14), _today_d - pd.Timedelta(days=8)),
+                "15-21 days ago": (_today_d - pd.Timedelta(days=21), _today_d - pd.Timedelta(days=15)),
+                "22-28 days ago": (_today_d - pd.Timedelta(days=28), _today_d - pd.Timedelta(days=22)),
+            }
+            with _ga_c2:
+                _ga_wlbl = st.selectbox("Week", list(_week_opts.keys()), key="ga_week")
+            _wstart, _wend = _week_opts[_ga_wlbl]
 
-    # ── Colour helpers ────────────────────────────────────────────────────────
-    _DIR_COLOUR = {
-        "heading_in":    "#f59e0b",   # amber — should question this decline
-        "lateral":       "#94a3b8",   # grey
-        "going_further": "#ef4444",   # red — clearly bad ping
-        "unknown":       "#6b7280",
-    }
+            with st.spinner("Loading trip data..."):
+                _ga_acc = db.load_gap_accepted([_ga_did], days_back=30)
+                _ga_dec = db.load_gap_declined([_ga_did], days_back=30)
 
-    # ── Pre-compute all gaps ──────────────────────────────────────────────────
-    all_gaps = {did: _find_gaps(did) for did in _GAP_IDS}
-    good_gaps_all = [g for did in _GAP_GOOD for g in all_gaps[did]]
-    bad_gaps_all  = [g for did in _GAP_BAD  for g in all_gaps[did]]
+            if _ga_acc.empty:
+                st.warning("No trip data found for this driver in the last 30 days.")
+            else:
+                _ga_acc["pickedup_trip_datetime"] = pd.to_datetime(_ga_acc["pickedup_trip_datetime"])
+                _ga_acc["dropoff_trip_datetime"]  = pd.to_datetime(_ga_acc["dropoff_trip_datetime"])
+                _ga_acc = _ga_acc.sort_values("pickedup_trip_datetime").reset_index(drop=True)
 
-    def _group_stats(gaps):
-        if not gaps:
-            return {"total": 0, "lhr": 0, "decision": 0, "avg_mins": 0,
-                    "pings": 0, "pings_per_gap": 0, "questionable": 0,
-                    "no_ping_pct": 0, "avg_score": 0}
-        n_lhr  = sum(1 for g in gaps if g["at_lhr"])
-        n_dec  = len(gaps) - n_lhr
-        dec_gaps = [g for g in gaps if not g["at_lhr"]]
-        all_pings = [p for g in dec_gaps for _, p in g["pings"].iterrows()]
-        q = sum(
-            1 for g in dec_gaps for _, p in g["pings"].iterrows()
-            if _classify_ping(p, g["stranded_zone"])[1].startswith("⚠️")
-        )
-        no_ping = sum(1 for g in dec_gaps if g["pings"].empty)
-        scores  = [_rate_rescue(g["rescue"], g["gap_mins"], g["stranded_zone"])[0] for g in gaps]
+                _ga_wk = _ga_acc[
+                    (_ga_acc["pickedup_trip_datetime"].dt.date >= _wstart) &
+                    (_ga_acc["pickedup_trip_datetime"].dt.date <= _wend)
+                ].reset_index(drop=True)
+
+                if _ga_wk.empty:
+                    st.info("No trips found in this window.")
+                else:
+                    _se_df    = _stuck_events(_ga_wk)
+                    _se_stuck = _se_df[_se_df["bucket"] == "25-75m"].reset_index(drop=True) if not _se_df.empty else pd.DataFrame()
+
+                    _n_trips   = len(_ga_wk)
+                    _n_stuck   = len(_se_stuck)
+                    _n_airport = int(_se_stuck["airport"].notna().sum()) if not _se_stuck.empty else 0
+                    _avg_stuck = _se_stuck["gap_mins"].mean() if not _se_stuck.empty else 0
+                    _total_lost = (_se_stuck["gap_mins"].sum() / 60 * _FLEET_RPH_DEFAULT) if not _se_stuck.empty else 0
+
+                    _sm1, _sm2, _sm3, _sm4, _sm5 = st.columns(5)
+                    _sm1.metric("Trips completed",        _n_trips)
+                    _sm2.metric("Stuck events (25-75 min)", _n_stuck)
+                    _sm3.metric("Avg stuck duration",     f"{_avg_stuck:.0f} min" if _n_stuck else "---")
+                    _sm4.metric("Stuck at airport",       _n_airport, help="Heathrow or Gatwick bounding box")
+                    _sm5.metric("Est. revenue lost",      f"GBP{_total_lost:.0f}", help=f"Stuck minutes x fleet RPH GBP{_FLEET_RPH_DEFAULT}/hr")
+
+                    # Missed pings during stuck windows — capture full start + end of each ping
+                    _missed_rows = []
+                    if not _ga_dec.empty and not _se_stuck.empty:
+                        _ga_dec2 = _ga_dec.copy()
+                        _time_col = "trip_booking_datetime" if "trip_booking_datetime" in _ga_dec2.columns else "pickedup_trip_datetime"
+                        _ga_dec2["_pt"] = pd.to_datetime(_ga_dec2[_time_col])
+                        for _se_idx, _se in _se_stuck.iterrows():
+                            _win = _ga_dec2[
+                                (_ga_dec2["_pt"] >= _se["stuck_from"]) &
+                                (_ga_dec2["_pt"] <= _se["stuck_until"])
+                            ]
+                            for _, _p in _win.iterrows():
+                                _pf_raw = float(_p.get("trip_price_in_pound", 0) or 0)
+                                _pc     = parse_dms(str(_p.get("pickup_lat_long", "") or ""))
+                                _dc     = parse_dms(str(_p.get("dropoff_latlong", "") or ""))
+                                if _pf_raw <= 0 and _pc[0] is not None and _dc[0] is not None:
+                                    _, _pf  = estimate_ping(_pc[0], _pc[1], _dc[0], _dc[1])
+                                    _pf     = float(_pf) if _pf else 0.0
+                                    _fe     = True
+                                else:
+                                    _pf, _fe = _pf_raw, False
+                                _pw  = _pc[1] is not None and _pc[1] < _WEST_LON
+                                _dw  = _dc[1] is not None and _dc[1] < _WEST_LON
+                                _pz  = assign_zone(_pc[0], _pc[1])
+                                _dz  = assign_zone(_dc[0], _dc[1])
+                                _cls = _classify_ping(_pf, _pz, _dz, _pw, _dw)
+                                _missed_rows.append({
+                                    "ping_time":    _p["_pt"],
+                                    "fare":         round(_pf, 2),
+                                    "fare_est":     _fe,
+                                    "plat":         _pc[0],  "plon": _pc[1],
+                                    "dlat":         _dc[0],  "dlon": _dc[1],
+                                    "pickup_west":  _pw,
+                                    "dropoff_west": _dw,
+                                    "pickup_zone":  _pz,
+                                    "dropoff_zone": _dz,
+                                    "decision":     _cls,
+                                    "gap_start":    _se["stuck_from"],
+                                    "gap_mins":     _se["gap_mins"],
+                                    "se_idx":       _se_idx,
+                                })
+                    _missed_df = pd.DataFrame(_missed_rows)
+                    _n_should  = int((_missed_df["decision"] == "Should accept").sum()) if not _missed_df.empty else 0
+
+                    if _n_stuck == 0:
+                        st.success(f"No stuck events this week -- {_n_trips} trips completed cleanly.")
+                    else:
+                        if _n_should > 0:
+                            st.markdown(
+                                f'<div style="background:#fef2f2;border-left:4px solid #ef4444;'
+                                f'padding:12px 16px;border-radius:6px;color:#1e1e2e;margin-bottom:8px;">'
+                                f'<strong>Red flag: {_n_should} high-value ping{"s" if _n_should>1 else ""} declined during stuck windows</strong> '
+                                f'(fare >= 20, or fare >= 15 + west of Charing Cross)'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                        # MAP
+                        st.markdown("#### Stuck locations map")
+                        st.caption("Orange/red bubbles = stuck windows (click to see pings)  |  Red = should accept  |  Yellow = borderline  |  Green = fine to decline  |  Filled dot = pickup, hollow = dropoff  |  Toggle layers top-right")
+
+                        _m_s = folium.Map(location=[51.505, -0.13], zoom_start=11, tiles="CartoDB positron")
+                        folium.GeoJson(GEOJSON_DATA, style_function=lambda f: {
+                            "fillColor": "#e2e8f0", "fillOpacity": 0.04, "color": "#cbd5e1", "weight": 0.6,
+                        }, name="Zone overlay").add_to(_m_s)
+                        folium.Marker(
+                            [51.507, _WEST_LON],
+                            icon=folium.DivIcon(
+                                html='<div style="color:#3b82f6;font-size:10px;white-space:nowrap;">← W | E →</div>',
+                                icon_size=(64, 14), icon_anchor=(32, 7),
+                            ),
+                        ).add_to(_m_s)
+
+                        _cls_colors = {
+                            "Should accept":   "#ef4444",
+                            "Borderline":      "#f59e0b",
+                            "Fine to decline": "#22c55e",
+                        }
+                        _cls_labels = {
+                            "Should accept": "SHOULD ACCEPT",
+                            "Borderline":    "Borderline",
+                            "Fine to decline": "OK",
+                        }
+
+                        # Separate FeatureGroups so user can toggle each layer
+                        _fg_stk = folium.FeatureGroup(name="Stuck windows",          show=True)
+                        _fg_sa  = folium.FeatureGroup(name="Should accept pings",    show=True)
+                        _fg_bl  = folium.FeatureGroup(name="Borderline pings",       show=True)
+                        _fg_ftd = folium.FeatureGroup(name="Fine to decline pings",  show=False)
+                        _fg_map = {"Should accept": _fg_sa, "Borderline": _fg_bl, "Fine to decline": _fg_ftd}
+
+                        # Ping lines + dots → routed into their FeatureGroup
+                        if not _missed_df.empty:
+                            for _, _mp in _missed_df.iterrows():
+                                _mc   = _cls_colors[_mp["decision"]]
+                                _fg   = _fg_map[_mp["decision"]]
+                                _mpz  = _mp.get("pickup_zone")
+                                _mdz  = _mp.get("dropoff_zone")
+                                _mrte = (f"Zone {int(_mpz)} → Zone {int(_mdz)}"
+                                         if _mpz and _mdz else
+                                         f"{'West' if _mp['pickup_west'] else 'East'} → {'West' if _mp['dropoff_west'] else 'East'}")
+                                _mfl  = f"~£{_mp['fare']:.2f} (est.)" if _mp.get("fare_est") else f"£{_mp['fare']:.2f}"
+                                _mlbl = _cls_labels[_mp["decision"]]
+                                _popup_p = folium.Popup(
+                                    html=(
+                                        f'<div style="font-family:sans-serif;min-width:200px;">'
+                                        f'<b style="font-size:13px;color:{_mc};">{_mlbl}</b>'
+                                        f'<hr style="margin:5px 0;border-color:#ddd;">'
+                                        f'<div style="font-size:12px;line-height:1.8;">'
+                                        f'<b>Time:</b> {_mp["ping_time"].strftime("%H:%M")}<br>'
+                                        f'<b>Fare:</b> {_mfl}<br>'
+                                        f'<b>Route:</b> {_mrte}</div></div>'
+                                    ),
+                                    max_width=250,
+                                )
+                                _has_pu = _mp["plat"] is not None and not pd.isna(_mp["plat"]) and 51.0 < _mp["plat"] < 52.0
+                                _has_do = _mp["dlat"] is not None and not pd.isna(_mp["dlat"]) and 51.0 < _mp["dlat"] < 52.0
+                                if _has_pu:
+                                    folium.CircleMarker(
+                                        [_mp["plat"], _mp["plon"]], radius=6,
+                                        color=_mc, fill=True, fill_opacity=0.85, weight=1,
+                                        tooltip=f"{_mlbl} | {_mfl} | {_mrte}",
+                                        popup=_popup_p,
+                                    ).add_to(_fg)
+                                if _has_do:
+                                    folium.CircleMarker(
+                                        [_mp["dlat"], _mp["dlon"]], radius=4,
+                                        color=_mc, fill=False, fill_opacity=0, weight=1.5,
+                                        tooltip=f"Dropoff | {_mrte}",
+                                    ).add_to(_fg)
+                                if _has_pu and _has_do:
+                                    folium.PolyLine(
+                                        [[_mp["plat"], _mp["plon"]], [_mp["dlat"], _mp["dlon"]]],
+                                        color=_mc, weight=1.5, opacity=0.45, dash_array="5",
+                                    ).add_to(_fg)
+
+                        # Stuck bubbles → stuck FeatureGroup, popup contains pings
+                        for _se_idx, _se in _se_stuck.iterrows():
+                            if _se["stuck_lat"] is None or pd.isna(_se["stuck_lat"]):
+                                continue
+                            _se_pings = _missed_df[_missed_df["se_idx"] == _se_idx] if not _missed_df.empty else pd.DataFrame()
+                            if not _se_pings.empty:
+                                _popup_rows = ""
+                                for _, _sp in _se_pings.sort_values("ping_time").iterrows():
+                                    _cc   = _cls_colors[_sp["decision"]]
+                                    _lbl  = _cls_labels[_sp["decision"]]
+                                    _spz  = _sp.get("pickup_zone")
+                                    _sdz  = _sp.get("dropoff_zone")
+                                    _srte = (f"Z{int(_spz)}→Z{int(_sdz)}"
+                                             if _spz and _sdz else
+                                             f"{'W' if _sp['pickup_west'] else 'E'}→{'W' if _sp['dropoff_west'] else 'E'}")
+                                    _sfl  = f"~£{_sp['fare']:.2f}" if _sp.get("fare_est") else f"£{_sp['fare']:.2f}"
+                                    _popup_rows += (
+                                        f'<tr style="border-bottom:1px solid #eee;">'
+                                        f'<td style="padding:3px 6px;color:#555;font-size:11px;">{_sp["ping_time"].strftime("%H:%M")}</td>'
+                                        f'<td style="padding:3px 6px;font-weight:bold;font-size:12px;">{_sfl}</td>'
+                                        f'<td style="padding:3px 6px;color:#555;font-size:11px;">{_srte}</td>'
+                                        f'<td style="padding:3px 6px;font-weight:bold;color:{_cc};font-size:11px;">{_lbl}</td>'
+                                        f'</tr>'
+                                    )
+                                _ping_table = (
+                                    f'<table style="width:100%;border-collapse:collapse;font-family:sans-serif;">'
+                                    f'<tr style="background:#f5f5f5;font-size:11px;">'
+                                    f'<th style="padding:4px 6px;text-align:left;">Time</th>'
+                                    f'<th style="padding:4px 6px;text-align:left;">Fare</th>'
+                                    f'<th style="padding:4px 6px;text-align:left;">Route</th>'
+                                    f'<th style="padding:4px 6px;text-align:left;">Call</th></tr>'
+                                    f'{_popup_rows}</table>'
+                                )
+                            else:
+                                _ping_table = '<p style="color:#999;font-size:12px;font-family:sans-serif;margin:4px 0;">No pings in this window</p>'
+
+                            _airport_badge = (
+                                f'<span style="background:#ef4444;color:#fff;font-size:10px;'
+                                f'padding:2px 6px;border-radius:3px;margin-left:6px;">STUCK AT {str(_se["airport"]).upper()}</span>'
+                                if _se["airport"] else ""
+                            )
+                            _popup_html = (
+                                f'<div style="min-width:300px;font-family:sans-serif;">'
+                                f'<b style="font-size:13px;">'
+                                f'{pd.Timestamp(_se["stuck_from"]).strftime("%a %d %b %H:%M")}'
+                                f' → {pd.Timestamp(_se["stuck_until"]).strftime("%H:%M")}'
+                                f' ({_se["gap_mins"]:.0f} min)</b>{_airport_badge}'
+                                f'<hr style="margin:6px 0;border-color:#ddd;">'
+                                f'<div style="font-size:11px;color:#666;margin-bottom:4px;">PINGS DURING THIS WINDOW</div>'
+                                f'{_ping_table}</div>'
+                            )
+                            _radius = max(8, min(20, _se["gap_mins"] / 4))
+                            _sc     = "#dc2626" if _se["airport"] else "#f97316"
+                            folium.CircleMarker(
+                                [_se["stuck_lat"], _se["stuck_lon"]], radius=_radius,
+                                color=_sc, fill=True, fill_opacity=0.55, weight=2.5,
+                                tooltip=f"Click for pings | {_se['gap_mins']:.0f} min | {pd.Timestamp(_se['stuck_from']).strftime('%H:%M')}–{pd.Timestamp(_se['stuck_until']).strftime('%H:%M')}",
+                                popup=folium.Popup(html=_popup_html, max_width=380),
+                            ).add_to(_fg_stk)
+
+                        _fg_stk.add_to(_m_s)
+                        _fg_sa.add_to(_m_s)
+                        _fg_bl.add_to(_m_s)
+                        _fg_ftd.add_to(_m_s)
+                        folium.LayerControl(position="topright", collapsed=False).add_to(_m_s)
+                        st_folium(_m_s, width="100%", height=560, returned_objects=[])
+
+                        # Gap timeline
+                        if not _se_df.empty:
+                            _fig_tl = px.bar(
+                                _se_df, x="stuck_from", y="gap_mins",
+                                color="bucket",
+                                color_discrete_map={"<25m": "#22c55e", "25-75m": "#f97316", ">75m": "#ef4444"},
+                                category_orders={"bucket": ["<25m", "25-75m", ">75m"]},
+                                title="All gaps this week -- coloured by duration bucket",
+                                labels={"stuck_from": "Time", "gap_mins": "Gap (min)", "bucket": "Category"},
+                                height=280,
+                            )
+                            _fig_tl.add_hline(y=25, line_dash="dash", line_color="#f97316",
+                                              annotation_text="25 min", annotation_position="top right")
+                            _fig_tl.add_hline(y=75, line_dash="dash", line_color="#ef4444",
+                                              annotation_text="75 min", annotation_position="top right")
+                            st.plotly_chart(_fig_tl, use_container_width=True)
+
+                        # Stuck events table
+                        st.markdown("#### Stuck events this week")
+                        _se_tbl = _se_stuck.copy()
+                        _se_tbl["Day & time"]    = pd.to_datetime(_se_tbl["stuck_from"]).dt.strftime("%a %d %b %H:%M")
+                        _se_tbl["Until"]         = pd.to_datetime(_se_tbl["stuck_until"]).dt.strftime("%H:%M")
+                        _se_tbl["Gap (min)"]     = _se_tbl["gap_mins"]
+                        _se_tbl["Prev fare"]     = _se_tbl["prev_fare"].apply(lambda x: f"GBP{x:.2f}")
+                        _se_tbl["Stuck at"]      = _se_tbl.apply(
+                            lambda r: f"Airport ({r['airport']})" if r["airport"]
+                            else ("West" if r["west"] else "East"),
+                            axis=1,
+                        )
+                        _se_tbl["Eventual ride"] = _se_tbl.apply(
+                            lambda r: (
+                                f"Z{int(r['next_pz'])} → Z{int(r['next_dz'])}  GBP{r['next_fare']:.2f}"
+                                if r.get("next_pz") and r.get("next_dz")
+                                else f"GBP{r['next_fare']:.2f}"
+                            ), axis=1,
+                        )
+                        st.dataframe(
+                            _se_tbl[["Day & time", "Until", "Gap (min)", "Prev fare", "Stuck at", "Eventual ride"]],
+                            use_container_width=True, hide_index=True,
+                        )
+
+                        # Missed pings table
+                        st.markdown("#### Pings missed during stuck windows")
+                        if not _missed_df.empty:
+                            _mp_tbl = _missed_df.copy()
+                            _mp_tbl["Time"]  = _mp_tbl["ping_time"].dt.strftime("%a %H:%M")
+                            _mp_tbl["Fare"]  = _mp_tbl.apply(
+                                lambda r: f"~GBP{r['fare']:.2f}" if r.get("fare_est") else f"GBP{r['fare']:.2f}",
+                                axis=1,
+                            )
+                            _mp_tbl["Route"] = _mp_tbl.apply(
+                                lambda r: (
+                                    f"Zone {int(r['pickup_zone'])} → Zone {int(r['dropoff_zone'])}"
+                                    if r.get("pickup_zone") and r.get("dropoff_zone") else
+                                    f"{'West' if r['pickup_west'] else 'East'} → {'West' if r['dropoff_west'] else '?'}"
+                                ), axis=1,
+                            )
+                            _mp_tbl["Decision"]   = _mp_tbl["decision"].map({
+                                "Should accept":   "RED - Should accept",
+                                "Borderline":      "YELLOW - Borderline",
+                                "Fine to decline": "OK - Fine to decline",
+                            })
+                            _mp_tbl["During gap"] = _mp_tbl["gap_start"].apply(
+                                lambda x: pd.Timestamp(x).strftime("%a %H:%M") if pd.notna(x) else "---"
+                            )
+                            st.dataframe(
+                                _mp_tbl[["Time","Fare","Route","Decision","During gap"]].sort_values("Time"),
+                                use_container_width=True, hide_index=True,
+                            )
+
+                            _dec_counts = _missed_df["decision"].value_counts().reset_index()
+                            _dec_counts.columns = ["Decision", "Count"]
+                            _fig_dec = px.bar(
+                                _dec_counts, x="Decision", y="Count",
+                                color="Decision",
+                                color_discrete_map={
+                                    "Should accept":   "#ef4444",
+                                    "Borderline":      "#f59e0b",
+                                    "Fine to decline": "#22c55e",
+                                },
+                                title="Declined ping classification during stuck windows",
+                                height=280,
+                            )
+                            _fig_dec.update_layout(showlegend=False)
+                            st.plotly_chart(_fig_dec, use_container_width=True)
+                        else:
+                            st.info("No declined pings found during stuck windows.")
+
+    # ── PART 2: FLEET COMPARISON ──────────────────────────────────────────────
+    st.divider()
+    st.subheader("Fleet comparison -- last 30 days")
+    st.caption("Stuck rate, gap quality, airport stranding, and revenue lost for Top 10 vs Comparison vs Rest of fleet.")
+
+    with st.spinner("Loading fleet trip data (30 days)..."):
+        _fc_top_acc  = db.load_gap_accepted(list(TOP_DRIVER_IDS), days_back=30)
+        _fc_cmp_acc  = db.load_gap_accepted(list(BAD_DRIVER_IDS), days_back=30)
+        _fc_all_ids  = db.load_fleet_driver_ids(days_back=30)
+        _fc_rest_ids = [i for i in _fc_all_ids if i not in set(TOP_DRIVER_IDS) and i not in set(BAD_DRIVER_IDS)]
+        _fc_rest_acc = db.load_gap_accepted(_fc_rest_ids, days_back=30)
+
+    with st.spinner("Loading declined pings for fleet..."):
+        _fc_top_dec  = db.load_gap_declined(list(TOP_DRIVER_IDS),  days_back=30)
+        _fc_cmp_dec  = db.load_gap_declined(list(BAD_DRIVER_IDS),  days_back=30)
+        _fc_rest_dec = db.load_gap_declined(_fc_rest_ids, days_back=30)
+
+    def _fleet_stuck_stats(acc_df):
+        if acc_df.empty:
+            return {"stuck_rate":0,"lhr_rate":0,"avg_stuck":0,"median_gap":0,
+                    "pct_lt25":0,"west_stuck_pct":0,"est_lost_per_driver":0}
+        df = acc_df.copy()
+        df["pickedup_trip_datetime"] = pd.to_datetime(df["pickedup_trip_datetime"])
+        df["dropoff_trip_datetime"]  = pd.to_datetime(df["dropoff_trip_datetime"])
+        df = df.sort_values(["dim_driver_id","pickedup_trip_datetime"])
+        all_gaps, stuck, lhr_stuck, west_stuck = [], [], [], []
+        for _, grp in df.groupby("dim_driver_id"):
+            grp = grp.reset_index(drop=True)
+            for i in range(1, len(grp)):
+                gap = (grp.iloc[i]["pickedup_trip_datetime"] - grp.iloc[i-1]["dropoff_trip_datetime"]).total_seconds()/60
+                if gap < 0: continue
+                all_gaps.append(gap)
+                if 25 <= gap <= 75:
+                    dc      = parse_dms(str(grp.iloc[i-1].get("dropoff_latlong","") or ""))
+                    airport = _is_airport(dc[0], dc[1])
+                    w       = dc[1] is not None and dc[1] < _WEST_LON
+                    stuck.append(gap)
+                    if airport: lhr_stuck.append(gap)
+                    if w:       west_stuck.append(gap)
+        n_gaps = len(all_gaps)
+        n_stuck = len(stuck)
+        n_drv = max(acc_df["dim_driver_id"].nunique(), 1)
+        est_lost = (sum(stuck) / 60 * _FLEET_RPH_DEFAULT) / n_drv
         return {
-            "total":         len(gaps),
-            "lhr":           n_lhr,
-            "decision":      n_dec,
-            "avg_mins":      round(np.mean([g["gap_mins"] for g in gaps]), 1),
-            "pings":         len(all_pings),
-            "pings_per_gap": round(len(all_pings) / max(n_dec, 1), 1),
-            "questionable":  q,
-            "no_ping_pct":   round(no_ping / max(n_dec, 1) * 100, 1),
-            "avg_score":     round(np.mean(scores), 1) if scores else 0,
+            "stuck_rate":          round(n_stuck / max(n_gaps,1) * 100, 1),
+            "lhr_rate":            round(len(lhr_stuck) / max(n_stuck,1) * 100, 1),
+            "avg_stuck":           round(np.mean(stuck), 1) if stuck else 0,
+            "median_gap":          round(np.median(all_gaps), 1) if all_gaps else 0,
+            "pct_lt25":            round(sum(1 for g in all_gaps if g < 25) / max(n_gaps,1) * 100, 1),
+            "west_stuck_pct":      round(len(west_stuck) / max(n_stuck,1) * 100, 1),
+            "est_lost_per_driver": round(est_lost, 0),
         }
 
-    gs = _group_stats(good_gaps_all)
-    bs = _group_stats(bad_gaps_all)
+    with st.spinner("Computing fleet stuck stats..."):
+        _fs_top  = _fleet_stuck_stats(_fc_top_acc)
+        _fs_cmp  = _fleet_stuck_stats(_fc_cmp_acc)
+        _fs_rest = _fleet_stuck_stats(_fc_rest_acc)
 
-    # ── Group comparison ──────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Group comparison — Top performers vs Comparison drivers")
-
-    cg, cb = st.columns(2)
-    with cg:
-        st.markdown("### ✅ Top performers (5 drivers)")
-        st.metric("Total gaps (25–75 min, Z3+)",  gs["total"])
-        st.metric("✈️ Heathrow queue gaps",        gs["lhr"])
-        st.metric("Active decision gaps",          gs["decision"])
-        st.metric("Avg gap length",                f"{gs['avg_mins']} min")
-        st.metric("Pings received during gaps",    gs["pings"])
-        st.metric("Pings per gap",                 gs["pings_per_gap"])
-        st.metric("Questionable declines",         gs["questionable"],
-                  "Heading back, ≥£10 — passed on")
-        st.metric("Gaps with zero pings",          f"{gs['no_ping_pct']}%",
-                  "Genuinely stranded, no options")
-        st.metric("Avg rescue trip score",         f"{gs['avg_score']}/10")
-
-    with cb:
-        st.markdown("### ⚠️ Comparison drivers (5 drivers)")
-        st.metric("Total gaps (25–75 min, Z3+)",  bs["total"],
-                  delta=f"{bs['total']-gs['total']:+d} vs top 10")
-        st.metric("✈️ Heathrow queue gaps",        bs["lhr"],
-                  delta=f"{bs['lhr']-gs['lhr']:+d}")
-        st.metric("Active decision gaps",          bs["decision"],
-                  delta=f"{bs['decision']-gs['decision']:+d}")
-        st.metric("Avg gap length",                f"{bs['avg_mins']} min",
-                  delta=f"{bs['avg_mins']-gs['avg_mins']:+.1f} min")
-        st.metric("Pings received during gaps",    bs["pings"],
-                  delta=f"{bs['pings']-gs['pings']:+d}")
-        st.metric("Pings per gap",                 bs["pings_per_gap"],
-                  delta=f"{bs['pings_per_gap']-gs['pings_per_gap']:+.1f}")
-        st.metric("Questionable declines",         bs["questionable"],
-                  delta=f"{bs['questionable']-gs['questionable']:+d}")
-        st.metric("Gaps with zero pings",          f"{bs['no_ping_pct']}%",
-                  delta=f"{bs['no_ping_pct']-gs['no_ping_pct']:+.1f}%")
-        st.metric("Avg rescue trip score",         f"{bs['avg_score']}/10",
-                  delta=f"{bs['avg_score']-gs['avg_score']:+.1f}")
-
-    # Visual bar comparison
-    comp_df = pd.DataFrame([
-        {"Metric": "Avg gap (min)",        "Top 10": gs["avg_mins"],      "Comparison": bs["avg_mins"]},
-        {"Metric": "Pings per gap",        "Top 10": gs["pings_per_gap"], "Comparison": bs["pings_per_gap"]},
-        {"Metric": "Questionable declines","Top 10": gs["questionable"],  "Comparison": bs["questionable"]},
-        {"Metric": "Zero-ping gaps %",     "Top 10": gs["no_ping_pct"],   "Comparison": bs["no_ping_pct"]},
-        {"Metric": "Rescue score /10",     "Top 10": gs["avg_score"],     "Comparison": bs["avg_score"]},
-    ])
-    fig_cmp = px.bar(
-        comp_df.melt(id_vars="Metric", var_name="Group", value_name="Value"),
-        x="Metric", y="Value", color="Group", barmode="group",
-        color_discrete_map={"Top 10": "#22c55e", "Comparison": "#ef4444"},
-        text_auto=".1f", title="Gap behaviour — key metrics compared",
-    )
-    fig_cmp.update_layout(height=380)
-    st.plotly_chart(fig_cmp, use_container_width=True)
-
-    # Narrative
-    st.markdown("#### What this tells us")
-    findings_gap = []
-
-    gap_diff = bs["avg_mins"] - gs["avg_mins"]
-    if gap_diff > 5:
-        findings_gap.append(
-            f"**Comparison drivers sit stranded {gap_diff:.0f} minutes longer on average** "
-            f"({bs['avg_mins']} min vs {gs['avg_mins']} min). That dead time compounds across a shift — "
-            f"if it happens 3 times a day, that's {gap_diff*3:.0f} extra minutes of zero earnings daily."
+    # Scorecard row
+    st.markdown("#### Stuck-event summary cards -- three groups")
+    _fsc1, _fsc2, _fsc3 = st.columns(3)
+    for _col, _lbl, _color, _fs in [
+        (_fsc1, "TOP 10",        "#22c55e", _fs_top),
+        (_fsc2, "REST OF FLEET", "#94a3b8", _fs_rest),
+        (_fsc3, "COMPARISON",    "#ef4444", _fs_cmp),
+    ]:
+        _rows2 = [
+            ("Stuck rate (25-75 min)", f"{_fs['stuck_rate']:.1f}%"),
+            ("Free-flowing gaps <25m", f"{_fs['pct_lt25']:.1f}%"),
+            ("Median gap",             f"{_fs['median_gap']:.0f} min"),
+            ("Avg stuck duration",     f"{_fs['avg_stuck']:.0f} min"),
+            ("Airport stuck %",        f"{_fs['lhr_rate']:.1f}%"),
+            ("West when stuck",        f"{_fs['west_stuck_pct']:.1f}%"),
+            ("Est. lost/driver (30d)", f"GBP{_fs['est_lost_per_driver']:.0f}"),
+        ]
+        _body2 = "".join(
+            f'<tr><td style="padding:4px 0;color:#94a3b8;font-size:12px;">{k}</td>'
+            f'<td style="text-align:right;font-weight:bold;color:#f8fafc;font-size:13px;">{v}</td></tr>'
+            for k, v in _rows2
         )
-    elif gap_diff < -5:
-        findings_gap.append(
-            f"**Top performers actually have longer average gaps** ({gs['avg_mins']} min vs {bs['avg_mins']} min). "
-            f"This likely reflects deliberate waiting for the right ping rather than thrashing — "
-            f"check their rescue trip scores to confirm they're being rewarded for the patience."
-        )
-
-    ping_diff = bs["pings_per_gap"] - gs["pings_per_gap"]
-    if ping_diff > 0.5:
-        findings_gap.append(
-            f"**Comparison drivers receive more pings per gap ({bs['pings_per_gap']} vs {gs['pings_per_gap']})** "
-            f"but their rescue trip scores are {'lower' if bs['avg_score'] < gs['avg_score'] else 'similar'}. "
-            f"They're getting offered trips — the question is whether they're taking the right ones."
-        )
-    elif ping_diff < -0.5:
-        findings_gap.append(
-            f"**Top performers receive more pings per gap ({gs['pings_per_gap']} vs {bs['pings_per_gap']})** — "
-            f"they're in areas with higher ping density even when stranded. "
-            f"Comparison drivers may be in genuinely dead locations (Zone 3 outer areas) "
-            f"where demand is lower."
-        )
-
-    if bs["questionable"] > gs["questionable"]:
-        findings_gap.append(
-            f"**Comparison drivers have {bs['questionable']} questionable declines vs {gs['questionable']} for the top 10.** "
-            f"These are pings heading back toward the city at ≥£10 that they passed on. "
-            f"Top performers are better at spotting and taking the 'rescue ping' that gets them out of a bad zone."
-        )
-
-    no_ping_diff = bs["no_ping_pct"] - gs["no_ping_pct"]
-    if no_ping_diff > 10:
-        findings_gap.append(
-            f"**{bs['no_ping_pct']}% of comparison driver gaps have zero pings** "
-            f"vs {gs['no_ping_pct']}% for top performers. "
-            f"This means comparison drivers are stranding themselves in areas with no demand — "
-            f"not just making bad decisions, but ending up in the wrong places entirely."
-        )
-
-    score_diff = gs["avg_score"] - bs["avg_score"]
-    if score_diff > 1:
-        findings_gap.append(
-            f"**Rescue trip quality: top performers score {gs['avg_score']}/10 vs {bs['avg_score']}/10.** "
-            f"When the top 10 finally take a trip after a gap, it's a better trip — "
-            f"higher fare, better direction, stronger wait-adjusted RPH. "
-            f"Comparison drivers end the gap with whatever comes first."
-        )
-
-    for i, f in enumerate(findings_gap):
-        icon = ["⏱️","📍","🎯","🗺️","⭐"][i % 5]
-        st.markdown(
-            f'<div style="background:#1e1e2e;border-left:4px solid #6366f1;'
-            f'padding:12px 16px;border-radius:6px;margin-bottom:10px;color:#e2e8f0;">'
-            f'<span style="font-size:16px;">{icon}</span> {f}'
+        _col.markdown(
+            f'<div style="background:#1e1e2e;border:2px solid {_color};border-radius:8px;padding:14px 16px;">'
+            f'<div style="color:{_color};font-size:11px;font-weight:bold;letter-spacing:1px;margin-bottom:6px;">{_lbl}</div>'
+            f'<table style="width:100%;border-collapse:collapse;">{_body2}</table>'
             f'</div>',
             unsafe_allow_html=True,
         )
 
-    if not findings_gap:
-        st.info("Gap patterns are similar between the two groups — the difference may lie in zone positioning rather than gap decision-making. Check the Good vs Bad page for zone flow analysis.")
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Outlier Spotlight ─────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("🔬 Outlier Spotlight")
-    st.caption(
-        "Four drivers who break the west-positioning → performance rule. "
-        "Three Cat A drivers succeeding with below-average west %, one Cat D driver failing despite 91% west pickup share."
+    # Gap distribution stacked bar
+    _gb_top30  = _gap_buckets(_compute_gaps(_fc_top_acc))
+    _gb_cmp30  = _gap_buckets(_compute_gaps(_fc_cmp_acc))
+    _gb_rest30 = _gap_buckets(_compute_gaps(_fc_rest_acc))
+
+    _gd30 = pd.DataFrame([
+        {"Group": "Top 10",        "<25m": _gb_top30["<25m"],  "25-75m": _gb_top30["25-75m"],  ">75m": _gb_top30[">75m"]},
+        {"Group": "Rest of fleet", "<25m": _gb_rest30["<25m"], "25-75m": _gb_rest30["25-75m"], ">75m": _gb_rest30[">75m"]},
+        {"Group": "Comparison",    "<25m": _gb_cmp30["<25m"],  "25-75m": _gb_cmp30["25-75m"],  ">75m": _gb_cmp30[">75m"]},
+    ]).melt(id_vars="Group", var_name="Bucket", value_name="% of gaps")
+
+    _fig_gd30 = px.bar(
+        _gd30, x="Group", y="% of gaps", color="Bucket", barmode="stack",
+        color_discrete_map={"<25m": "#22c55e", "25-75m": "#f97316", ">75m": "#ef4444"},
+        category_orders={"Group": ["Top 10","Rest of fleet","Comparison"]},
+        title="Gap distribution -- 30 days", height=320,
     )
+    _fig_gd30.update_layout(yaxis_ticksuffix="%", legend_title="Gap bucket")
+    st.plotly_chart(_fig_gd30, use_container_width=True)
 
-    _SPOT_IDS   = [219, 215, 180, 223]
-    _SPOT_NAMES = {219: "Mohamed Yousuf", 215: "Mukhtar Abdullahi", 180: "Abdi Mohamed", 223: "Akeame Plummer"}
-    _SPOT_CAT   = {219: "A", 215: "A", 180: "A", 223: "D"}
-    _SPOT_WEST  = {219: 25.7, 215: 33.8, 180: 42.6, 223: 92.6}  # full 2026 dataset, pickup lon
+    # Stuck rate + free-flowing side by side
+    _sr_df = pd.DataFrame([
+        {"Group":"Top 10",       "Stuck %": _fs_top["stuck_rate"],  "Free-flowing %": _fs_top["pct_lt25"]},
+        {"Group":"Rest of fleet","Stuck %": _fs_rest["stuck_rate"], "Free-flowing %": _fs_rest["pct_lt25"]},
+        {"Group":"Comparison",   "Stuck %": _fs_cmp["stuck_rate"],  "Free-flowing %": _fs_cmp["pct_lt25"]},
+    ])
+    _sr_c1, _sr_c2 = st.columns(2)
+    with _sr_c1:
+        _fig_sr = px.bar(_sr_df, x="Group", y="Stuck %", color="Group",
+                         color_discrete_map={"Top 10":"#22c55e","Rest of fleet":"#94a3b8","Comparison":"#ef4444"},
+                         text="Stuck %", title="Stuck rate -- % of gaps 25-75 min", height=300)
+        _fig_sr.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        _fig_sr.update_layout(showlegend=False, yaxis_ticksuffix="%")
+        st.plotly_chart(_fig_sr, use_container_width=True)
+    with _sr_c2:
+        _fig_ff = px.bar(_sr_df, x="Group", y="Free-flowing %", color="Group",
+                         color_discrete_map={"Top 10":"#22c55e","Rest of fleet":"#94a3b8","Comparison":"#ef4444"},
+                         text="Free-flowing %", title="Free-flowing -- % of gaps under 25 min", height=300)
+        _fig_ff.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        _fig_ff.update_layout(showlegend=False, yaxis_ticksuffix="%")
+        st.plotly_chart(_fig_ff, use_container_width=True)
 
-    with st.spinner("Loading outlier trip data (30 days)..."):
-        _spot_perf    = db.load_comparison_performance(_SPOT_IDS)
-        _spot_acc_raw = db.load_gap_accepted(_SPOT_IDS, days_back=30)
-        _spot_dec_raw = db.load_gap_declined(_SPOT_IDS, days_back=30)
+    # Airport + west-when-stuck
+    _ap_df = pd.DataFrame([
+        {"Group":"Top 10",       "Airport stuck %": _fs_top["lhr_rate"],  "West when stuck %": _fs_top["west_stuck_pct"]},
+        {"Group":"Rest of fleet","Airport stuck %": _fs_rest["lhr_rate"], "West when stuck %": _fs_rest["west_stuck_pct"]},
+        {"Group":"Comparison",   "Airport stuck %": _fs_cmp["lhr_rate"],  "West when stuck %": _fs_cmp["west_stuck_pct"]},
+    ])
+    _ap_c1, _ap_c2 = st.columns(2)
+    with _ap_c1:
+        _fig_ap = px.bar(_ap_df, x="Group", y="Airport stuck %", color="Group",
+                         color_discrete_map={"Top 10":"#22c55e","Rest of fleet":"#94a3b8","Comparison":"#ef4444"},
+                         text="Airport stuck %", title="% of stuck events at Heathrow / Gatwick", height=300)
+        _fig_ap.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        _fig_ap.update_layout(showlegend=False, yaxis_ticksuffix="%")
+        st.plotly_chart(_fig_ap, use_container_width=True)
+    with _ap_c2:
+        _fig_ws = px.bar(_ap_df, x="Group", y="West when stuck %", color="Group",
+                         color_discrete_map={"Top 10":"#22c55e","Rest of fleet":"#94a3b8","Comparison":"#ef4444"},
+                         text="West when stuck %", title="% stuck in west London (better recovery zone)", height=300)
+        _fig_ws.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        _fig_ws.update_layout(showlegend=False, yaxis_ticksuffix="%")
+        st.plotly_chart(_fig_ws, use_container_width=True)
 
-    if not _spot_acc_raw.empty:
-        _spot_acc = _spot_acc_raw.copy()
-        _spot_acc["pickedup_trip_datetime"] = pd.to_datetime(_spot_acc["pickedup_trip_datetime"])
-        _spot_acc["dropoff_trip_datetime"]  = pd.to_datetime(_spot_acc["dropoff_trip_datetime"])
-        _spot_acc = _spot_acc.sort_values(["dim_driver_id", "pickedup_trip_datetime"])
-        _spot_acc["prev_drop"] = _spot_acc.groupby("dim_driver_id")["dropoff_trip_datetime"].shift(1)
-        _spot_acc["gap_mins"] = (
-            (_spot_acc["pickedup_trip_datetime"] - _spot_acc["prev_drop"])
-            .dt.total_seconds().div(60).clip(lower=0)
-        )
-        # Parse pickup coordinates for east/west analysis
-        _sp_coords = _spot_acc["pickup_lat_long"].apply(parse_dms)
-        _spot_acc["plat"] = [c[0] for c in _sp_coords]
-        _spot_acc["plon"] = [c[1] for c in _sp_coords]
-        _spot_acc = _spot_acc.dropna(subset=["plat","plon"])
-        _spot_acc = _spot_acc[_spot_acc["plat"].between(51.3, 51.7) & _spot_acc["plon"].between(-0.55, 0.3)]
-        _spot_acc["is_west"] = _spot_acc["plon"] < -0.12
-        _spot_acc["hour"]    = pd.to_datetime(_spot_acc["pickedup_trip_datetime"]).dt.hour
+    # Revenue lost per driver
+    _el_df = pd.DataFrame([
+        {"Group":"Top 10",       "Est lost / driver GBP": _fs_top["est_lost_per_driver"]},
+        {"Group":"Rest of fleet","Est lost / driver GBP": _fs_rest["est_lost_per_driver"]},
+        {"Group":"Comparison",   "Est lost / driver GBP": _fs_cmp["est_lost_per_driver"]},
+    ])
+    _fig_el = px.bar(_el_df, x="Group", y="Est lost / driver GBP", color="Group",
+                     color_discrete_map={"Top 10":"#22c55e","Rest of fleet":"#94a3b8","Comparison":"#ef4444"},
+                     text="Est lost / driver GBP",
+                     title="Estimated revenue lost per driver from stuck events (30 days)", height=300)
+    _fig_el.update_traces(texttemplate="GBP%{text:.0f}", textposition="outside")
+    _fig_el.update_layout(showlegend=False, yaxis_title="GBP lost")
+    st.plotly_chart(_fig_el, use_container_width=True)
+    st.caption(f"Estimate: total stuck minutes x fleet avg RPH (GBP{_FLEET_RPH_DEFAULT}/hr) / driver count. Assumes driver was available during gap.")
 
-        def _spot_gap_stats(df):
-            g = df["gap_mins"].dropna()
-            g = g[g > 0]
-            if len(g) == 0:
-                return {"median": 0, "short": 0, "gap": 0, "brk": 0}
-            return {
-                "median": g.median(),
-                "short":  (g < 25).mean() * 100,
-                "gap":    ((g >= 25) & (g <= 75)).mean() * 100,
-                "brk":    (g > 75).mean() * 100,
-            }
-
-        # ── 4 driver cards ────────────────────────────────────────────────────
-        _spot_cols = st.columns(4)
-        for _si, _did in enumerate([219, 215, 180, 223]):
-            _pr = _spot_perf[_spot_perf["dim_driver_id"] == _did]
-            if _pr.empty:
-                continue
-            _p        = _pr.iloc[0]
-            _dt       = _spot_acc[_spot_acc["dim_driver_id"] == _did]
-            _gs       = _spot_gap_stats(_dt)
-            _cat      = _SPOT_CAT[_did]
-            _ccol     = "#22c55e" if _cat == "A" else "#ef4444"
-            _avg_fare = _dt["trip_price_in_pound"].mean() if len(_dt) else 0
-            _sub10    = (_dt["trip_price_in_pound"] < 10).mean() * 100 if len(_dt) else 0
-
-            with _spot_cols[_si]:
-                st.markdown(
-                    f'<div style="background:#1e1e2e;border:2px solid {_ccol};border-radius:8px;padding:12px 14px;">'
-                    f'<div style="color:{_ccol};font-size:11px;font-weight:bold;letter-spacing:1px;">CAT {_cat}</div>'
-                    f'<div style="font-size:15px;font-weight:bold;color:#f8fafc;margin-top:2px;">{_SPOT_NAMES[_did]}</div>'
-                    f'<div style="color:#94a3b8;font-size:12px;">West %: <strong style="color:#facc15">{_SPOT_WEST[_did]:.0f}%</strong></div>'
-                    f'<hr style="border-color:#333;margin:8px 0">'
-                    f'<table style="width:100%;font-size:12px;color:#e2e8f0;border-collapse:collapse;">'
-                    f'<tr><td style="padding:2px 0">RPH</td><td style="text-align:right;font-weight:bold;color:{_ccol}">£{_p.rph:.2f}</td></tr>'
-                    f'<tr><td>Acceptance</td><td style="text-align:right">{_p.acceptance:.0f}%</td></tr>'
-                    f'<tr><td>Avg fare</td><td style="text-align:right">£{_avg_fare:.2f}</td></tr>'
-                    f'<tr><td>Sub-£10</td><td style="text-align:right">{_sub10:.0f}%</td></tr>'
-                    f'<tr><td style="padding-top:6px">Median gap</td><td style="text-align:right;padding-top:6px">{_gs["median"]:.0f} min</td></tr>'
-                    f'<tr><td>&lt;25m (normal)</td><td style="text-align:right">{_gs["short"]:.0f}%</td></tr>'
-                    f'<tr><td>25–75m (stranded)</td><td style="text-align:right">{_gs["gap"]:.0f}%</td></tr>'
-                    f'<tr><td>&gt;75m (break)</td><td style="text-align:right">{_gs["brk"]:.0f}%</td></tr>'
-                    f'</table></div>',
-                    unsafe_allow_html=True,
-                )
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # ── Gap distribution + fare distribution side by side ─────────────────
-        _sc1, _sc2 = st.columns(2)
-
-        with _sc1:
-            _gap_rows = []
-            for _did in _SPOT_IDS:
-                _dt = _spot_acc[_spot_acc["dim_driver_id"] == _did]
-                _gs = _spot_gap_stats(_dt)
-                for _bucket, _val in [("<25m", _gs["short"]), ("25–75m", _gs["gap"]), (">75m", _gs["brk"])]:
-                    _gap_rows.append({"Driver": _SPOT_NAMES[_did], "Bucket": _bucket, "Pct": _val})
-            _gap_bar_df = pd.DataFrame(_gap_rows)
-            _fig_gaps = px.bar(
-                _gap_bar_df, x="Driver", y="Pct", color="Bucket",
-                barmode="stack",
-                color_discrete_map={"<25m": "#22c55e", "25–75m": "#f59e0b", ">75m": "#ef4444"},
-                title="Gap distribution — 30 days",
-                labels={"Pct": "% of inter-trip gaps"},
-                height=320,
-            )
-            _fig_gaps.update_layout(yaxis_ticksuffix="%", legend_title="Gap bucket")
-            st.plotly_chart(_fig_gaps, use_container_width=True)
-
-        with _sc2:
-            _fare_rows = []
-            for _did in _SPOT_IDS:
-                _dt = _spot_acc[_spot_acc["dim_driver_id"] == _did]
-                if len(_dt) == 0:
-                    continue
-                for _bucket, _mask in [
-                    ("Sub-£10",  _dt["trip_price_in_pound"] < 10),
-                    ("£10–20",   (_dt["trip_price_in_pound"] >= 10) & (_dt["trip_price_in_pound"] < 20)),
-                    ("£20–30",   (_dt["trip_price_in_pound"] >= 20) & (_dt["trip_price_in_pound"] < 30)),
-                    ("£30+",     _dt["trip_price_in_pound"] >= 30),
-                ]:
-                    _fare_rows.append({"Driver": _SPOT_NAMES[_did], "Band": _bucket, "Pct": _mask.mean() * 100})
-            _fare_bar_df = pd.DataFrame(_fare_rows)
-            _fig_fares = px.bar(
-                _fare_bar_df, x="Driver", y="Pct", color="Band",
-                barmode="stack",
-                color_discrete_map={"Sub-£10": "#ef4444", "£10–20": "#f59e0b", "£20–30": "#60a5fa", "£30+": "#22c55e"},
-                title="Fare distribution — 30 days",
-                labels={"Pct": "% of trips"},
-                height=320,
-            )
-            _fig_fares.update_layout(yaxis_ticksuffix="%", legend_title="Fare band")
-            st.plotly_chart(_fig_fares, use_container_width=True)
-
-        # ── East vs West deep dive ────────────────────────────────────────────
-        st.markdown("#### East vs West — does positioning actually translate to better fares?")
-
-        _ew1, _ew2 = st.columns(2)
-
-        with _ew1:
-            # Avg fare east vs west per driver
-            _ew_fare_rows = []
-            for _did in _SPOT_IDS:
-                _dt = _spot_acc[_spot_acc["dim_driver_id"] == _did]
-                if len(_dt) == 0:
-                    continue
-                for _side, _sg in _dt.groupby("is_west"):
-                    _label = "West (<-0.12°)" if _side else "East (≥-0.12°)"
-                    _ew_fare_rows.append({
-                        "Driver": _SPOT_NAMES[_did],
-                        "Side":   _label,
-                        "Avg fare (£)": _sg["trip_price_in_pound"].mean(),
-                        "Sub-£10 %":    (_sg["trip_price_in_pound"] < 10).mean() * 100,
-                        "£30+ %":       (_sg["trip_price_in_pound"] >= 30).mean() * 100,
-                        "Trips":        len(_sg),
-                    })
-            _ew_df = pd.DataFrame(_ew_fare_rows)
-            _fig_ew = px.bar(
-                _ew_df, x="Driver", y="Avg fare (£)", color="Side", barmode="group",
-                color_discrete_map={"West (<-0.12°)": "#60a5fa", "East (≥-0.12°)": "#fb923c"},
-                text="Avg fare (£)",
-                title="Avg fare — East vs West pickups",
-                height=330,
-            )
-            _fig_ew.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
-            _fig_ew.update_layout(yaxis_title="Avg fare (£)", legend_title="Zone")
-            st.plotly_chart(_fig_ew, use_container_width=True)
-
-        with _ew2:
-            # Sub-£10 east vs west
-            _fig_sub10 = px.bar(
-                _ew_df, x="Driver", y="Sub-£10 %", color="Side", barmode="group",
-                color_discrete_map={"West (<-0.12°)": "#60a5fa", "East (≥-0.12°)": "#fb923c"},
-                text="Sub-£10 %",
-                title="Sub-£10 trip rate — East vs West",
-                height=330,
-            )
-            _fig_sub10.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-            _fig_sub10.update_layout(yaxis_ticksuffix="%", yaxis_title="% of trips under £10", legend_title="Zone")
-            st.plotly_chart(_fig_sub10, use_container_width=True)
-
-        # Hourly avg longitude — where is each driver sitting through the day?
-        st.markdown("#### Where they roam — avg pickup longitude by hour")
-        st.caption("More negative = further west. -0.12° = Charing Cross line. Dips below the grey band = actively west.")
-
-        _drift_rows = []
-        for _did in _SPOT_IDS:
-            _dt = _spot_acc[(_spot_acc["dim_driver_id"] == _did) & _spot_acc["hour"].notna()]
-            if len(_dt) == 0:
-                continue
-            for _hr, _hg in _dt.groupby("hour"):
-                _drift_rows.append({
-                    "Driver": _SPOT_NAMES[_did],
-                    "Hour":   int(_hr),
-                    "Avg longitude": _hg["plon"].mean(),
-                    "Trips":  len(_hg),
-                })
-        _drift_df = pd.DataFrame(_drift_rows)
-        if not _drift_df.empty:
-            _fig_drift = px.line(
-                _drift_df, x="Hour", y="Avg longitude", color="Driver",
-                color_discrete_map={
-                    "Mohamed Yousuf":  "#22c55e",
-                    "Mukhtar Abdullahi": "#60a5fa",
-                    "Abdi Mohamed":    "#a78bfa",
-                    "Akeame Plummer":  "#ef4444",
-                },
-                markers=True,
-                title="Hourly pickup longitude — east/west drift through the shift",
-                height=370,
-                labels={"Avg longitude": "Avg pickup longitude", "Hour": "Hour of day"},
-            )
-            _fig_drift.add_hrect(
-                y0=-0.25, y1=-0.12,
-                fillcolor="#60a5fa", opacity=0.08,
-                annotation_text="West of Charing Cross", annotation_position="top left",
-            )
-            _fig_drift.add_hline(y=-0.12, line_dash="dash", line_color="#94a3b8",
-                                 annotation_text="-0.12° boundary", annotation_position="right")
-            _fig_drift.update_layout(xaxis=dict(tickmode="linear", dtick=2))
-            st.plotly_chart(_fig_drift, use_container_width=True)
-
-        # ── Driver narratives ─────────────────────────────────────────────────
-        st.markdown("#### What's really going on")
-        _n1, _n2 = st.columns(2)
-        with _n1:
-            st.markdown(
-                '<div style="background:#1e1e2e;border-left:4px solid #22c55e;padding:12px 14px;border-radius:6px;color:#e2e8f0;margin-bottom:12px;">'
-                '<strong style="color:#22c55e;">🎯 Mohamed Yousuf — Long-haul cherry-picker</strong><br><br>'
-                'Only <strong>26% west</strong> and <strong>23% acceptance</strong> — both the lowest of any Cat A driver. '
-                'He declines 2,100+ pings a year but when he IS in the west, <strong>32% of those trips are £30+</strong> '
-                '(vs 15% from the east). He only enters the west for premium fares. From the east, his Z4/Z5 trips '
-                'avg <strong>£22</strong>, Z6 avg <strong>£28</strong> — long hauls back toward the city. '
-                'The drift chart shows he stays east until 8–9am when he briefly pushes west for the morning premium, '
-                'then retreats. Less positioning, more predatory trip selection.'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                '<div style="background:#1e1e2e;border-left:4px solid #22c55e;padding:12px 14px;border-radius:6px;color:#e2e8f0;">'
-                '<strong style="color:#22c55e;">⚡ Mukhtar Abdullahi — Throughput machine</strong><br><br>'
-                '<strong>34% west</strong> — similar to Yousuf, but a completely different strategy. '
-                'The drift chart shows he barely moves all day, hovering near center (-0.08 to -0.12). '
-                'He doesn\'t chase positioning — <strong>80% of gaps are under 25 minutes</strong> and his '
-                'median gap is just <strong>11 minutes</strong>. Sub-£10 rate drops from 30% (east) to 20% '
-                '(west), but he doesn\'t need much: volume × nearly zero dead time = Cat A RPH without '
-                'ever committing to a side of the city.'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-        with _n2:
-            st.markdown(
-                '<div style="background:#1e1e2e;border-left:4px solid #22c55e;padding:12px 14px;border-radius:6px;color:#e2e8f0;margin-bottom:12px;">'
-                '<strong style="color:#22c55e;">⚖️ Abdi Mohamed — The strategic drifter</strong><br><br>'
-                '<strong>43% west</strong> — highest of the Cat A outliers and it shows in his RPH (£23.33, best here). '
-                'The drift chart reveals his actual strategy: he starts <strong>far east at 4am</strong> (lon -0.06), '
-                'gradually pushes west by 9am (lon -0.18, fully across the boundary), works the west peak, '
-                'then retreats east by evening. His west trips earn £20.08 vs £17.91 east — <strong>a £2.17 '
-                'premium per fare</strong> that compounds across hundreds of trips. He\'s the one who actually '
-                'uses positioning as a deliberate time-of-day tool.'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                '<div style="background:#1e1e2e;border-left:4px solid #ef4444;padding:12px 14px;border-radius:6px;color:#e2e8f0;">'
-                '<strong style="color:#ef4444;">🚨 Akeame Plummer — Static and indiscriminate</strong><br><br>'
-                '<strong>93% west</strong> — parked in the west all day. The drift chart is nearly a flat line '
-                '(-0.16 at every hour, zero movement). He has the position but completely squanders it: '
-                '<strong>38% sub-£10 from west pickups</strong>, avg fare just <strong>£12.88</strong>. '
-                'His 7 east trips actually averaged <strong>£14.85</strong> — he earns more on the rare '
-                'occasion he goes east. He\'s accepting every short cheap Z1/Z2 fare the west throws at him '
-                'with a 12-minute pickup wait. The west position earns him better pings; '
-                'he just never acts on them. Needs to reject the sub-£10 offers and wait for what the '
-                'location deserves.'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-
-        # ── Same-location comparison ───────────────────────────────────────────
-        st.divider()
-        st.markdown("#### The same east pings, completely different decisions")
-        st.caption(
-            "Yousuf, Bartley, and Emran operate in the same east London areas. "
-            "The pings on their screen are identical. What they choose to accept is not."
-        )
-
-        _COMPARE_IDS  = [219, 82, 32]
-        _COMPARE_NAMES = {219: "Yousuf (Cat A)", 82: "Bartley (Cat D)", 32: "Emran (Cat C2)"}
-
-        with st.spinner("Loading east location comparison..."):
-            _cmp_acc = pd.read_sql("""
-                SELECT dim_driver_id, pickup_lat_long, trip_price_in_pound
-                FROM rep_fact_trips
-                WHERE dim_driver_id = ANY(%s)
-                  AND status IN ('completed','Finished')
-                  AND pickup_lat_long IS NOT NULL AND pickup_lat_long != ''
-                  AND distance_in_miles <= 60
-                  AND pickedup_trip_datetime >= '2026-01-01'
-            """, db.get_conn(), params=(_COMPARE_IDS,))
-            _cmp_dec = pd.read_sql("""
-                SELECT dim_driver_id, pickup_lat_long
-                FROM rep_fact_trips
-                WHERE dim_driver_id = ANY(%s)
-                  AND status IN ('Driver did not respond','Driver rejected')
-                  AND pickup_lat_long IS NOT NULL AND pickup_lat_long != ''
-                  AND trip_booking_datetime >= '2026-01-01'
-            """, db.get_conn(), params=(_COMPARE_IDS,))
-
-        def _add_east_area(df):
-            _c = df["pickup_lat_long"].apply(parse_dms)
-            df = df.copy()
-            df["plat"] = [c[0] for c in _c]
-            df["plon"] = [c[1] for c in _c]
-            df = df.dropna(subset=["plat","plon"])
-            df = df[df["plat"].between(51.3,51.7) & df["plon"].between(-0.55,0.3)]
-            df["is_east"] = df["plon"] >= -0.12
-
-            def _area(lon):
-                if lon < -0.08: return "Inner East\n(City / Clerkenwell)"
-                if lon < -0.02: return "Mid East\n(Shoreditch / Hackney)"
-                if lon <  0.02: return "Canary Wharf\n/ Stratford"
-                if lon <  0.08: return "Outer East\n(Greenwich / Ilford)"
-                return               "Far East\n(Romford / Barking)"
-
-            df["area"] = df["plon"].apply(_area)
-            return df
-
-        _cmp_acc = _add_east_area(_cmp_acc)
-        _cmp_dec = _add_east_area(_cmp_dec)
-        _cmp_acc_e = _cmp_acc[_cmp_acc["is_east"]]
-        _cmp_dec_e = _cmp_dec[_cmp_dec["is_east"]]
-
-        _AREA_ORDER = [
-            "Inner East\n(City / Clerkenwell)",
-            "Mid East\n(Shoreditch / Hackney)",
-            "Canary Wharf\n/ Stratford",
-            "Outer East\n(Greenwich / Ilford)",
-            "Far East\n(Romford / Barking)",
-        ]
-
-        # Build per-driver per-area stats
-        _loc_rows = []
-        for _did in _COMPARE_IDS:
-            for _area in _AREA_ORDER:
-                _ae = _cmp_acc_e[(_cmp_acc_e["dim_driver_id"]==_did) & (_cmp_acc_e["area"]==_area)]
-                _de = _cmp_dec_e[(_cmp_dec_e["dim_driver_id"]==_did) & (_cmp_dec_e["area"]==_area)]
-                _total_pings = len(_ae) + len(_de)
-                if _total_pings == 0:
-                    continue
-                _loc_rows.append({
-                    "Driver":       _COMPARE_NAMES[_did],
-                    "Area":         _area,
-                    "Pings":        _total_pings,
-                    "Accepted":     len(_ae),
-                    "Accept %":     len(_ae) / _total_pings * 100,
-                    "Avg fare":     _ae["trip_price_in_pound"].mean() if len(_ae) else 0,
-                    "Sub-£10 %":    (_ae["trip_price_in_pound"] < 10).mean() * 100 if len(_ae) else 0,
-                    "£20+ %":       (_ae["trip_price_in_pound"] >= 20).mean() * 100 if len(_ae) else 0,
-                })
-        _loc_df = pd.DataFrame(_loc_rows)
-
-        _lc1, _lc2 = st.columns(2)
-
-        with _lc1:
-            _fig_accept = px.bar(
-                _loc_df, x="Area", y="Accept %", color="Driver", barmode="group",
-                color_discrete_map={
-                    "Yousuf (Cat A)":  "#22c55e",
-                    "Bartley (Cat D)": "#ef4444",
-                    "Emran (Cat C2)":  "#fb923c",
-                },
-                text="Accept %",
-                title="Acceptance rate — same east locations",
-                category_orders={"Area": _AREA_ORDER},
-                height=360,
-            )
-            _fig_accept.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-            _fig_accept.update_layout(yaxis_ticksuffix="%", yaxis_title="% of pings accepted",
-                                      xaxis_tickangle=-20)
-            st.plotly_chart(_fig_accept, use_container_width=True)
-
-        with _lc2:
-            _fig_avgfare = px.bar(
-                _loc_df, x="Area", y="Avg fare", color="Driver", barmode="group",
-                color_discrete_map={
-                    "Yousuf (Cat A)":  "#22c55e",
-                    "Bartley (Cat D)": "#ef4444",
-                    "Emran (Cat C2)":  "#fb923c",
-                },
-                text="Avg fare",
-                title="Avg fare from accepted trips — same east locations",
-                category_orders={"Area": _AREA_ORDER},
-                height=360,
-            )
-            _fig_avgfare.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
-            _fig_avgfare.update_layout(yaxis_title="Avg accepted fare (£)", xaxis_tickangle=-20)
-            st.plotly_chart(_fig_avgfare, use_container_width=True)
-
-        # Sub-£10 comparison
-        _fig_sub10 = px.bar(
-            _loc_df, x="Area", y="Sub-£10 %", color="Driver", barmode="group",
-            color_discrete_map={
-                "Yousuf (Cat A)":  "#22c55e",
-                "Bartley (Cat D)": "#ef4444",
-                "Emran (Cat C2)":  "#fb923c",
-            },
-            text="Sub-£10 %",
-            title="Sub-£10 acceptance rate — same east locations",
-            category_orders={"Area": _AREA_ORDER},
+    # Quality of declined pings
+    st.markdown("#### Quality of pings declined -- what is each group passing on?")
+    _dec_fare_rows = []
+    for _gl, _df_dec in [("Top 10",_fc_top_dec),("Rest of fleet",_fc_rest_dec),("Comparison",_fc_cmp_dec)]:
+        if _df_dec.empty: continue
+        _f = _df_dec["trip_price_in_pound"].dropna()
+        _f = _f[_f > 0]
+        if len(_f) == 0: continue
+        for _band, _mask in [("Sub-10",_f<10),("10-20",(_f>=10)&(_f<20)),("20-30",(_f>=20)&(_f<30)),("30+",_f>=30)]:
+            _dec_fare_rows.append({"Group":_gl, "Fare band":_band, "Pct of declined":round(_mask.mean()*100,1)})
+    if _dec_fare_rows:
+        _fig_dfq = px.bar(
+            pd.DataFrame(_dec_fare_rows), x="Group", y="Pct of declined",
+            color="Fare band", barmode="stack",
+            color_discrete_map={"Sub-10":"#ef4444","10-20":"#f59e0b","20-30":"#60a5fa","30+":"#22c55e"},
+            category_orders={"Group":["Top 10","Rest of fleet","Comparison"]},
+            title="Fare bands of pings each group is declining",
             height=320,
         )
-        _fig_sub10.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-        _fig_sub10.update_layout(yaxis_ticksuffix="%", yaxis_title="% of accepted trips under £10",
-                                 xaxis_tickangle=-20)
-        st.plotly_chart(_fig_sub10, use_container_width=True)
+        _fig_dfq.update_layout(yaxis_ticksuffix="%", legend_title="Fare band")
+        st.plotly_chart(_fig_dfq, use_container_width=True)
 
+    # Per-driver median gap bar
+    st.markdown("#### Median gap per driver (last 30 days)")
+    _pd_rows = []
+    for _gl, _gdf in [("Top 10",_fc_top_acc),("Comparison",_fc_cmp_acc),("Rest of fleet",_fc_rest_acc)]:
+        if _gdf.empty: continue
+        for _did, _dgrp in _gdf.groupby("dim_driver_id"):
+            _dg  = _compute_gaps(_dgrp)
+            _dgb = _gap_buckets(_dg)
+            _db_name = (
+                _dgrp["driver_full_name"].dropna().iloc[0]
+                if "driver_full_name" in _dgrp.columns and not _dgrp["driver_full_name"].dropna().empty
+                else None
+            )
+            _dname = DRIVER_NAMES.get(_did) or _db_name or str(_did)
+            _pd_rows.append({
+                "Driver":     _dname,
+                "Group":      _gl,
+                "Median gap": _dgb["median"],
+                "Stuck %":    _dgb["25-75m"],
+            })
+    if _pd_rows:
+        _pd_df = pd.DataFrame(_pd_rows).sort_values("Median gap")
+        _fig_pd = px.bar(
+            _pd_df, x="Median gap", y="Driver", orientation="h",
+            color="Group",
+            color_discrete_map={"Top 10":"#22c55e","Comparison":"#ef4444","Rest of fleet":"#94a3b8"},
+            text="Median gap",
+            title="Median inter-trip gap per driver -- last 30 days",
+            height=max(400, len(_pd_df)*22+80),
+        )
+        _fig_pd.update_traces(texttemplate="%{text:.0f} min", textposition="outside")
+        _fig_pd.update_layout(xaxis_title="Median gap (min)", yaxis={"categoryorder":"total ascending"})
+        st.plotly_chart(_fig_pd, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ZONE ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "Zone Analysis":
+    st.title("Zone Analysis")
+    st.caption("Why Zone 3 is a trap, exactly which parts, which drivers keep ending up there, and whether the inner-East theory holds.")
+
+    with st.spinner("Loading 30 days of fleet trips (cached after first load)..."):
+        _za_raw = _load_zone_trips(days_back=30)
+
+    if _za_raw.empty:
+        st.error("No trip data found.")
+        st.stop()
+
+    with st.spinner("Assigning zones and computing gaps..."):
+        _za_raw = _za_raw.copy()
+        _za_raw["pickedup_trip_datetime"] = pd.to_datetime(_za_raw["pickedup_trip_datetime"])
+        _za_raw["dropoff_trip_datetime"]  = pd.to_datetime(_za_raw["dropoff_trip_datetime"])
+        _pu = _za_raw["pickup_lat_long"].apply(lambda x: parse_dms(str(x or "")))
+        _do = _za_raw["dropoff_latlong"].apply(lambda x: parse_dms(str(x or "")))
+        _za_raw["plat"] = [c[0] for c in _pu]
+        _za_raw["plon"] = [c[1] for c in _pu]
+        _za_raw["dlat"] = [c[0] for c in _do]
+        _za_raw["dlon"] = [c[1] for c in _do]
+        _za = _za_raw.dropna(subset=["plat","plon","dlat","dlon"]).copy()
+        _za = _za[
+            (51.2 < _za["dlat"]) & (_za["dlat"] < 51.8) &
+            (51.2 < _za["plat"]) & (_za["plat"] < 51.8)
+        ].reset_index(drop=True)
+        _za["pickup_zone"]  = [assign_zone(lat, lon) for lat, lon in zip(_za["plat"], _za["plon"])]
+        _za["dropoff_zone"] = [assign_zone(lat, lon) for lat, lon in zip(_za["dlat"], _za["dlon"])]
+        _za["dropoff_west"] = _za["dlon"] < _WEST_LON
+        _za["pickup_west"]  = _za["plon"] < _WEST_LON
+        _za["fare"]         = pd.to_numeric(_za["trip_price_in_pound"], errors="coerce").fillna(0)
+
+        # Gap to next trip per driver
+        _za = _za.sort_values(["dim_driver_id","pickedup_trip_datetime"]).reset_index(drop=True)
+        _za["next_pickup"] = _za.groupby("dim_driver_id")["pickedup_trip_datetime"].shift(-1)
+        _za["gap_after"]   = (_za["next_pickup"] - _za["dropoff_trip_datetime"]).dt.total_seconds() / 60
+        _za["gap_after"]   = _za["gap_after"].clip(0, 90)  # cap at 90 min
+
+        # Handy labels
+        _za["dropoff_side"]  = _za["dlon"].apply(lambda x: "West" if x < _WEST_LON else "East")
+        _za["zone_side"]     = "Z" + _za["dropoff_zone"].astype(str) + " " + _za["dropoff_side"]
+
+    # ── SECTION 1: Avg gap by zone ────────────────────────────────────────────
+    st.subheader("1 — Average wait time after dropping off, by zone")
+    st.caption("How long does a driver typically sit idle after each zone? Lower = better.")
+
+    _gap_by_zone = (
+        _za.dropna(subset=["gap_after","dropoff_zone"])
+        .groupby("dropoff_zone")["gap_after"]
+        .agg(avg_gap="mean", median_gap="median", count="count")
+        .reset_index()
+        .sort_values("dropoff_zone")
+    )
+    _gap_by_zone["Zone"] = "Zone " + _gap_by_zone["dropoff_zone"].astype(str)
+    _color_z = ["#22c55e","#4ade80","#f59e0b","#fb923c","#ef4444","#dc2626"]
+    _fig_gbz = px.bar(
+        _gap_by_zone, x="Zone", y="avg_gap",
+        color="Zone",
+        color_discrete_sequence=_color_z,
+        text="avg_gap",
+        title="Average gap after dropoff — all fleet drivers, 30 days",
+        labels={"avg_gap": "Avg gap (min)", "Zone": ""},
+        height=320,
+    )
+    _fig_gbz.update_traces(texttemplate="%{text:.1f} min", textposition="outside")
+    _fig_gbz.update_layout(showlegend=False, yaxis_title="Minutes waiting")
+    st.plotly_chart(_fig_gbz, use_container_width=True)
+
+    # Also show fare by zone
+    _fare_by_zone = (
+        _za[_za["fare"] > 0]
+        .groupby("dropoff_zone")["fare"]
+        .agg(avg_fare="mean", median_fare="median")
+        .reset_index()
+        .sort_values("dropoff_zone")
+    )
+    _fare_by_zone["Zone"] = "Zone " + _fare_by_zone["dropoff_zone"].astype(str)
+    _fz_c1, _fz_c2 = st.columns(2)
+    with _fz_c1:
+        _fig_fz = px.bar(
+            _fare_by_zone, x="Zone", y="avg_fare",
+            color="Zone", color_discrete_sequence=_color_z,
+            text="avg_fare", title="Avg fare by dropoff zone",
+            labels={"avg_fare": "Avg fare (£)"}, height=280,
+        )
+        _fig_fz.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
+        _fig_fz.update_layout(showlegend=False)
+        st.plotly_chart(_fig_fz, use_container_width=True)
+    with _fz_c2:
+        # % of trips by zone
+        _zone_counts = _za["dropoff_zone"].value_counts().reset_index()
+        _zone_counts.columns = ["dropoff_zone","count"]
+        _zone_counts["Zone"] = "Zone " + _zone_counts["dropoff_zone"].astype(str)
+        _fig_zc = px.pie(
+            _zone_counts.sort_values("dropoff_zone"), values="count", names="Zone",
+            color="Zone",
+            color_discrete_map={f"Zone {i}": _color_z[i-1] for i in range(1,7)},
+            title="Share of all dropoffs by zone",
+            height=280,
+        )
+        _fig_zc.update_traces(textinfo="percent+label")
+        _fig_zc.update_layout(showlegend=False)
+        st.plotly_chart(_fig_zc, use_container_width=True)
+
+    st.divider()
+
+    # ── SECTION 2: East vs West within each zone ──────────────────────────────
+    st.subheader("2 — The inner-East theory: does it hold?")
+    st.caption("Avg gap per zone split by East vs West. If inner East is fine but outer East is bad, you'll see it here.")
+
+    _zone_side_gap = (
+        _za.dropna(subset=["gap_after","dropoff_zone"])
+        .groupby(["dropoff_zone","dropoff_side"])["gap_after"]
+        .agg(avg_gap="mean", trips="count")
+        .reset_index()
+    )
+    _zone_side_gap["Zone"] = "Zone " + _zone_side_gap["dropoff_zone"].astype(str)
+    _zone_side_gap = _zone_side_gap[_zone_side_gap["trips"] >= 10]  # exclude tiny samples
+
+    _fig_ew = px.bar(
+        _zone_side_gap.sort_values(["dropoff_zone","dropoff_side"]),
+        x="Zone", y="avg_gap",
+        color="dropoff_side",
+        barmode="group",
+        color_discrete_map={"East": "#ef4444", "West": "#3b82f6"},
+        text="avg_gap",
+        title="Avg gap after dropoff — East vs West, per zone",
+        labels={"avg_gap": "Avg gap (min)", "dropoff_side": "Side"},
+        height=360,
+    )
+    _fig_ew.update_traces(texttemplate="%{text:.1f} min", textposition="outside")
+    _fig_ew.update_layout(yaxis_title="Minutes waiting")
+    st.plotly_chart(_fig_ew, use_container_width=True)
+
+    # Write the conclusion in a callout
+    _z1e = _zone_side_gap[(_zone_side_gap["dropoff_zone"]==1) & (_zone_side_gap["dropoff_side"]=="East")]["avg_gap"].values
+    _z3e = _zone_side_gap[(_zone_side_gap["dropoff_zone"]==3) & (_zone_side_gap["dropoff_side"]=="East")]["avg_gap"].values
+    _z3w = _zone_side_gap[(_zone_side_gap["dropoff_zone"]==3) & (_zone_side_gap["dropoff_side"]=="West")]["avg_gap"].values
+    _z1e_v = float(_z1e[0]) if len(_z1e) else None
+    _z3e_v = float(_z3e[0]) if len(_z3e) else None
+    _z3w_v = float(_z3w[0]) if len(_z3w) else None
+
+    if _z1e_v and _z3e_v:
+        _diff = _z3e_v - _z1e_v
         st.markdown(
-            '<div style="background:#1e1e2e;border-left:4px solid #facc15;padding:14px 16px;'
-            'border-radius:6px;color:#e2e8f0;margin-top:4px;">'
-            '<strong>What this proves:</strong> Yousuf is not in a special part of the east. '
-            'In every single east London area — City, Shoreditch, Canary Wharf, Outer East — '
-            'he receives similar ping volumes to Bartley and Emran. The pings are the same. '
-            'His Inner East avg fare is <strong>£25.27 with 0% sub-£10</strong>. '
-            'Bartley\'s Inner East avg is <strong>£11.80 with 51% sub-£10</strong>. '
-            'Same streets, same Bolt algorithm, different filter. '
-            'The east is not the problem — accepting low-value east pings is the problem.'
-            '</div>',
+            f'<div style="background:#fef3c7;border-left:4px solid #f59e0b;padding:12px 16px;'
+            f'border-radius:6px;color:#1e1e2e;margin-bottom:8px;">'
+            f'<strong>Verdict:</strong> Zone 3 East averages <strong>{_z3e_v:.0f} min</strong> idle vs '
+            f'<strong>{_z1e_v:.0f} min</strong> in Zone 1 East — a <strong>+{_diff:.0f} min penalty</strong> '
+            f'per drop. '
+            + (f'Zone 3 West ({_z3w_v:.0f} min) is meaningfully better than Zone 3 East.'
+               if _z3w_v and _z3w_v < _z3e_v else "") +
+            f'</div>',
             unsafe_allow_html=True,
         )
 
     st.divider()
-    # ── Render per-driver ─────────────────────────────────────────────────────
-    st.markdown("### ✅ Top performers")
-    _good_tabs = st.tabs([f"{_GAP_NAMES[did]}" for did in _GAP_GOOD])
-    st.markdown("### ⚠️ Comparison drivers")
-    _bad_tabs  = st.tabs([f"{_GAP_NAMES[did]}" for did in _GAP_BAD])
-    _tabs = _good_tabs + _bad_tabs
 
-    for tab, driver_id in zip(_tabs, _GAP_IDS):
-        with tab:
-            driver_name = _GAP_NAMES[driver_id]
-            gaps = all_gaps[driver_id]
+    # ── SECTION 3: Zone 3 dead zone map ──────────────────────────────────────
+    st.subheader("3 — Where exactly in Zone 3 are drivers getting stuck?")
+    st.caption("Each dot is a Zone 3 dropoff. Red = long wait, green = quick next trip. Hover for details.")
 
-            if not gaps:
-                st.success(f"No qualifying gaps found for {driver_name} in the last 14 days.")
-                continue
+    _z3_map = _za[(_za["dropoff_zone"] == 3) & _za["gap_after"].notna()].copy()
 
-            # Summary banner
-            n_gaps         = len(gaps)
-            n_lhr          = sum(1 for g in gaps if g["at_lhr"])
-            n_decision     = n_gaps - n_lhr
-            avg_gap        = np.mean([g["gap_mins"] for g in gaps])
-            total_pings    = sum(len(g["pings"]) for g in gaps if not g["at_lhr"])
-            questionable   = sum(
-                sum(1 for _, row in g["pings"].iterrows()
-                    if _classify_ping(row, g["stranded_zone"])[1].startswith("⚠️"))
-                for g in gaps if not g["at_lhr"]
-            )
+    if not _z3_map.empty:
+        _z3_map["gap_label"] = _z3_map["gap_after"].apply(lambda x: f"{x:.0f} min gap")
+        _z3_map["side_label"] = _z3_map["dropoff_side"]
 
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Total gaps",            n_gaps)
-            c2.metric("✈️ Heathrow queue",     n_lhr,      "Structural — not actionable")
-            c3.metric("Decision gaps",         n_decision, "Where choices were made")
-            c4.metric("Pings during waits",    total_pings,"Excludes LHR gaps")
-            c5.metric("Questionable declines", questionable,
-                      "Heading back, ≥£10 fare" if questionable else "All calls look fine")
+        _fig_z3m = px.scatter_mapbox(
+            _z3_map, lat="dlat", lon="dlon",
+            color="gap_after",
+            color_continuous_scale=["#22c55e","#f59e0b","#ef4444"],
+            range_color=[0, 50],
+            size="gap_after",
+            size_max=12,
+            hover_name="driver_full_name",
+            hover_data={"gap_after": ":.0f", "fare": ":.2f", "dropoff_side": True, "dlat": False, "dlon": False},
+            mapbox_style="carto-positron",
+            zoom=10.5,
+            center={"lat": 51.49, "lon": -0.02},
+            title="Zone 3 dropoffs — coloured by wait time after drop (red = stuck)",
+            height=540,
+            labels={"gap_after": "Gap (min)", "fare": "Fare £", "dropoff_side": "Side", "driver_full_name": "Driver"},
+        )
+        _fig_z3m.update_layout(
+            coloraxis_colorbar=dict(title="Gap (min)", ticksuffix=" min"),
+            margin=dict(l=0, r=0, t=40, b=0),
+        )
+        st.plotly_chart(_fig_z3m, use_container_width=True)
+    else:
+        st.info("No Zone 3 dropoff data with gap information.")
 
-            st.divider()
-
-            for idx, gap in enumerate(gaps, 1):
-                strand  = gap["stranding"]
-                rescue  = gap["rescue"]
-                pings   = gap["pings"]
-                sz      = gap["stranded_zone"]
-                gm      = gap["gap_mins"]
-                ts      = strand["dropoff_trip_datetime"].strftime("%a %d %b, %H:%M")
-
-                lhr_flag = " ✈️ STRANDED AT HEATHROW — queue issue" if gap["at_lhr"] else ""
-                lbl = (f"Gap {idx} — {ts} · Stranded Zone {sz} · {gm:.0f} min wait · "
-                       f"{len(pings)} ping{'s' if len(pings) != 1 else ''} received{lhr_flag}")
-
-                with st.expander(lbl):
-                    left, right = st.columns([1, 1])
-
-                    with left:
-                        if gap["at_lhr"]:
-                            st.warning(
-                                "✈️ **Driver is in the Heathrow queue.** "
-                                "Pings here are irrelevant — the driver can't leave the queue to take them. "
-                                "This gap is a structural problem (airport queue), not a decision problem."
-                            )
-                        st.markdown(f"**Stranding trip** (left them in Zone {sz})")
-                        st.markdown(
-                            f"- Pickup: Z{int(strand['pickup_zone'] or 0)} → Dropoff: Z{sz}\n"
-                            f"- Fare: £{strand['trip_price_in_pound']:.2f} · "
-                            f"{strand['distance_in_miles']:.1f} mi · "
-                            f"{strand['pob_duration_in_min']:.0f} min ride"
-                        )
-                        score, stars, label, detail = _rate_rescue(rescue, gm, sz)
-                        rescue_dz = int(rescue["dropoff_zone"] or 0)
-                        st.markdown(f"**Rescue trip** (ended the wait after {gm:.0f} min)")
-                        st.markdown(
-                            f"- Pickup: Z{sz} → Dropoff: Z{rescue_dz}\n"
-                            f"- Fare: £{rescue['trip_price_in_pound']:.2f} · "
-                            f"{rescue['distance_in_miles']:.1f} mi"
-                        )
-                        colour = ("#22c55e" if score >= 6
-                                  else "#f59e0b" if score >= 4
-                                  else "#ef4444")
-                        st.markdown(
-                            f'<div style="background:#1e1e2e;border-left:4px solid {colour};'
-                            f'padding:10px 14px;border-radius:4px;margin-top:6px;">'
-                            f'<span style="font-size:20px;color:#facc15;letter-spacing:2px;">{stars}</span> &nbsp;'
-                            f'<strong style="color:{colour};">{label}</strong><br>'
-                            f'<span style="color:#94a3b8;font-size:12px;">{detail}</span>'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                        if pings.empty:
-                            st.markdown("**No pings received during this gap.**  \n"
-                                        "_Driver had no choice — genuinely dead zone._")
-                        else:
-                            st.markdown(f"**{len(pings)} ping(s) during the gap:**")
-                            ping_rows = []
-                            for _, p in pings.iterrows():
-                                pz  = int(p["pickup_zone"])  if pd.notna(p.get("pickup_zone"))  else "?"
-                                dz  = int(p["dropoff_zone"]) if pd.notna(p.get("dropoff_zone")) else "?"
-                                direction, verdict = _classify_ping(p, sz)
-
-                                # Fare and distance are null for declined trips in the DB
-                                # — compute from coords using haversine + Bolt pricing
-                                fare_db = p.get("trip_price_in_pound")
-                                dist_db = p.get("distance_in_miles")
-                                est_dist, est_fare = estimate_ping(
-                                    p.get("plat"), p.get("plon"),
-                                    p.get("dlat"), p.get("dlon"),
-                                )
-                                if fare_db and fare_db > 0:
-                                    fare_str = f"£{fare_db:.2f}"
-                                elif est_fare:
-                                    fare_str = f"~£{est_fare:.2f}"
-                                else:
-                                    fare_str = "—"
-                                if dist_db and dist_db > 0:
-                                    dist_str = f"{dist_db:.1f}"
-                                elif est_dist:
-                                    dist_str = f"~{est_dist:.1f}"
-                                else:
-                                    dist_str = "—"
-
-                                ping_rows.append({
-                                    "Time":    p["trip_booking_datetime"].strftime("%H:%M"),
-                                    "From Z":  pz,
-                                    "To Z":    dz,
-                                    "Est fare": fare_str,
-                                    "Est miles": dist_str,
-                                    "Verdict": verdict,
-                                })
-                            st.dataframe(pd.DataFrame(ping_rows), use_container_width=True, hide_index=True)
-
-                    with right:
-                        # Mini map: stranding dropoff + ping arrows + rescue pickup
-                        clat = strand["dropoff_lat"] if pd.notna(strand.get("dropoff_lat")) else CENTER_LAT
-                        clon = strand["dropoff_lon"] if pd.notna(strand.get("dropoff_lon")) else CENTER_LON
-                        m = folium.Map(location=[clat, clon], zoom_start=11,
-                                       tiles="CartoDB dark_matter")
-                        folium.GeoJson(
-                            GEOJSON_DATA,
-                            style_function=lambda f: {
-                                "fillColor": "#ffffff", "fillOpacity": 0.03,
-                                "color": "#555555", "weight": 1,
-                            }
-                        ).add_to(m)
-
-                        # Where they got stranded
-                        if pd.notna(strand.get("dropoff_lat")):
-                            folium.Marker(
-                                [strand["dropoff_lat"], strand["dropoff_lon"]],
-                                icon=folium.DivIcon(
-                                    html='<div style="font-size:18px;">📍</div>',
-                                    icon_size=(24, 24), icon_anchor=(12, 24),
-                                ),
-                                tooltip=f"Stranded here — Z{sz}",
-                            ).add_to(m)
-
-                        # Declined pings
-                        for _, p in pings.iterrows():
-                            if pd.isna(p.get("plat")): continue
-                            direction, verdict = _classify_ping(p, sz)
-                            colour = _DIR_COLOUR.get(direction, "#6b7280")
-                            if pd.notna(p.get("dlat")):
-                                folium.PolyLine(
-                                    [(p["plat"], p["plon"]), (p["dlat"], p["dlon"])],
-                                    color=colour, weight=2.5, opacity=0.8,
-                                    tooltip=f"Declined: {p['trip_booking_datetime'].strftime('%H:%M')} | "
-                                            f"Z{int(p['pickup_zone'] or 0)}→Z{int(p['dropoff_zone'] or 0)} | "
-                                            f"£{p.get('trip_price_in_pound', 0):.2f} | {verdict}",
-                                ).add_to(m)
-                            folium.CircleMarker(
-                                [p["plat"], p["plon"]], radius=5,
-                                color=colour, fill=True, fill_opacity=0.9,
-                                tooltip=f"Declined ping {p['trip_booking_datetime'].strftime('%H:%M')}",
-                            ).add_to(m)
-
-                        # Rescue trip
-                        if pd.notna(rescue.get("pickup_lat")) and pd.notna(rescue.get("dropoff_lat")):
-                            folium.PolyLine(
-                                [(rescue["pickup_lat"], rescue["pickup_lon"]),
-                                 (rescue["dropoff_lat"], rescue["dropoff_lon"])],
-                                color="#22c55e", weight=3, opacity=0.9,
-                                tooltip=f"Eventual trip: £{rescue['trip_price_in_pound']:.2f} | "
-                                        f"Z{int(rescue['pickup_zone'] or 0)}→Z{int(rescue['dropoff_zone'] or 0)}",
-                            ).add_to(m)
-                            folium.CircleMarker(
-                                [rescue["pickup_lat"], rescue["pickup_lon"]],
-                                radius=6, color="#22c55e", fill=True, fill_opacity=1,
-                                tooltip="Rescue pickup",
-                            ).add_to(m)
-
-                        st_folium(m, width="100%", height=340, returned_objects=[])
-
-                    # Legend
-                    st.markdown(
-                        '<span style="color:#f59e0b">━</span> Amber = heading back toward city (declined — worth questioning) &nbsp;&nbsp;'
-                        '<span style="color:#ef4444">━</span> Red = going further out (right call to decline) &nbsp;&nbsp;'
-                        '<span style="color:#94a3b8">━</span> Grey = lateral move &nbsp;&nbsp;'
-                        '<span style="color:#22c55e">━</span> Green = trip eventually taken',
-                        unsafe_allow_html=True,
-                    )
-
-# ── Trip Flow ────────────────────────────────────────────────────────────────
-elif page == "Trip Flow":
-    st.title("Trip Flow — Accepted vs Declined")
-    st.caption("Bolt doesn't show drivers the fare on a ping — they decide purely based on pickup location and destination. This shows what routes they took vs turned down.")
-
-    if not os.path.exists(_FLOW_PATH):
-        st.error("Run `python build_flow.py` once to generate flow_data.parquet")
-        st.stop()
-
-    flow = pd.read_parquet(_FLOW_PATH)
-    flow = flow[flow["dim_driver_id"].isin(selected_ids)]
-
-    hour_range = st.slider("Filter by hour of day", 0, 23, (0, 23))
-    flow = flow[(flow["hour"] >= hour_range[0]) & (flow["hour"] <= hour_range[1])]
-
-    accepted = flow[flow["outcome"] == "Accepted"]
-    declined = flow[flow["outcome"] == "Declined"]
-
-    st.markdown(f"**{len(accepted):,} accepted** · **{len(declined):,} declined** in this hour window")
-
-    # ── Pickup→Dropoff zone heatmaps side by side
-    st.subheader("Pickup Zone → Dropoff Zone  (what routes are they taking vs turning down?)")
-
-    def make_flow_heatmap(df, title, colour):
-        pivot = df.groupby(["pickup_zone","dropoff_zone"]).size().unstack(fill_value=0)
-        pivot.index   = [f"Pickup Z{z}" for z in pivot.index]
-        pivot.columns = [f"Dropoff Z{z}" for z in pivot.columns]
-        pct = (pivot.div(pivot.values.sum()) * 100).round(1)
-        fig = px.imshow(pct, text_auto=".1f", color_continuous_scale=colour,
-                        labels={"x":"Dropoff Zone","y":"Pickup Zone","color":"% of trips"},
-                        title=title, aspect="auto")
-        fig.update_layout(height=360, coloraxis_showscale=False)
-        return fig
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.plotly_chart(make_flow_heatmap(accepted, "ACCEPTED trips — % of total", "Greens"), use_container_width=True)
-    with col2:
-        st.plotly_chart(make_flow_heatmap(declined, "DECLINED trips — % of total", "Reds"), use_container_width=True)
-
-    st.info("📌 Read each cell as: '% of all accepted/declined trips that had this pickup→dropoff combination.'\n"
-            "High values on the diagonal = local trips staying in the same zone. Off-diagonal = cross-zone runs.")
-
-    # ── Delta heatmap: where accepted ≠ declined
-    st.subheader("Delta — where accepted rate differs most from declined rate")
-    st.caption("Green = drivers accept these routes proportionally MORE than they decline. Red = they decline these MORE than they accept.")
-
-    def flow_pct(df):
-        p = df.groupby(["pickup_zone","dropoff_zone"]).size().unstack(fill_value=0)
-        return (p.div(p.values.sum()) * 100).reindex(index=range(1,7), columns=range(1,7), fill_value=0)
-
-    acc_pct = flow_pct(accepted)
-    dec_pct = flow_pct(declined)
-    delta = (acc_pct - dec_pct).round(2)
-    delta.index   = [f"Pickup Z{z}" for z in delta.index]
-    delta.columns = [f"Dropoff Z{z}" for z in delta.columns]
-    fig_d = px.imshow(delta, text_auto=".1f", color_continuous_scale="RdYlGn",
-                      color_continuous_midpoint=0,
-                      labels={"x":"Dropoff Zone","y":"Pickup Zone","color":"Accept% − Decline%"},
-                      aspect="auto")
-    fig_d.update_layout(height=400)
-    st.plotly_chart(fig_d, use_container_width=True)
-    st.caption("Green cells = routes they actively prefer. Red cells = routes they actively avoid.")
-
-    # ── Bar: what dropoff zone do they prefer vs avoid?
-    st.subheader("Do they prefer or avoid certain dropoff zones?")
-    dropoff_compare = pd.DataFrame({
-        "Dropoff Zone": [f"Zone {z}" for z in range(1,7)],
-        "Accepted %": [accepted["dropoff_zone"].eq(z).mean()*100 for z in range(1,7)],
-        "Declined %": [declined["dropoff_zone"].eq(z).mean()*100 for z in range(1,7)],
-    })
-    fig_b = px.bar(dropoff_compare.melt(id_vars="Dropoff Zone", var_name="Outcome", value_name="% of trips"),
-                   x="Dropoff Zone", y="% of trips", color="Outcome", barmode="group",
-                   color_discrete_map={"Accepted %":"#22c55e","Declined %":"#ef4444"})
-    fig_b.update_layout(height=360)
-    st.plotly_chart(fig_b, use_container_width=True)
-
-    # ── Key insight box
-    acc_z1do = accepted["dropoff_zone"].eq(1).mean()*100
-    dec_z1do = declined["dropoff_zone"].eq(1).mean()*100
-    acc_z56do = accepted["dropoff_zone"].ge(5).mean()*100
-    dec_z56do = declined["dropoff_zone"].ge(5).mean()*100
-    st.info(f"📌 **Zone 1 dropoffs**: {acc_z1do:.0f}% of accepted vs {dec_z1do:.0f}% of declined — "
-            f"they decline {'more' if dec_z1do > acc_z1do else 'fewer'} trips going TO Zone 1.\n\n"
-            f"📌 **Zone 5-6 dropoffs**: {acc_z56do:.0f}% of accepted vs {dec_z56do:.0f}% of declined — "
-            f"they accept {'more' if acc_z56do > dec_z56do else 'fewer'} long-haul trips going to outer zones.\n\n"
-            "On Bolt, drivers see an estimated fare and distance before accepting. Low fare + short distance in Zone 1 gridlock is a clear decline signal — the full-cycle maths puts those trips below their shift average.")
-
-# ── Zone 1 Selectivity ────────────────────────────────────────────────────────
-elif page == "Zone 1 Selectivity":
-    st.title("Zone 1 Selectivity")
-    st.caption("Zone 1 is both the most accepted AND most declined pickup zone. What specifically are they choosing?")
-
-    if not os.path.exists(_FLOW_PATH):
-        st.error("flow_data.parquet not found — run `python build_flow.py` first.")
-        st.stop()
-
-    with st.spinner("Loading trip flow data..."):
-        flow = pd.read_parquet(_FLOW_PATH)
-        flow = flow[flow["dim_driver_id"].isin(selected_ids)]
-
-    z1_pickup  = flow[flow["pickup_zone"]  == 1].copy()
-    z1_dropoff = flow[flow["dropoff_zone"] == 1].copy()
-
-    z1_acc = z1_pickup[z1_pickup["outcome"] == "Accepted"]
-    z1_dec = z1_pickup[z1_pickup["outcome"] == "Declined"]
-
-    avg_dist_acc  = z1_acc["distance_in_miles"].mean()
-    avg_dist_dec  = z1_dec["distance_in_miles"].mean()
-    avg_fare_acc  = z1_acc["trip_price_in_pound"].dropna().replace(0, pd.NA).dropna().mean()
-    avg_fare_dec  = z1_dec["trip_price_in_pound"].dropna().replace(0, pd.NA).dropna().mean()
-    z1_local_acc  = (z1_acc["dropoff_zone"] == 1).mean() * 100
-    z1_local_dec  = (z1_dec["dropoff_zone"] == 1).mean() * 100
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Z1 pickups accepted", f"{len(z1_acc):,}")
-    col2.metric("Z1 pickups declined", f"{len(z1_dec):,}")
-    col3.metric("Avg distance accepted", f"{avg_dist_acc:.1f} mi",
-                f"+{avg_dist_acc - avg_dist_dec:.1f} mi vs declined")
-    col4.metric("Avg fare accepted", f"£{avg_fare_acc:.2f}" if pd.notna(avg_fare_acc) else "N/A",
-                f"+£{avg_fare_acc - avg_fare_dec:.2f} vs declined" if pd.notna(avg_fare_acc) and pd.notna(avg_fare_dec) else "")
-
-    # ── SECTION 1: Where do Z1 pickups go? ───────────────────────────────────
     st.divider()
-    st.subheader("1 — Where do Zone 1 pickups go? (accepted vs declined)")
 
-    col_a, col_b = st.columns(2)
-    for df_side, title, cscale, col in [
-        (z1_acc, "✅ Accepted — dropoff zone", "Greens", col_a),
-        (z1_dec, "❌ Declined — dropoff zone", "Reds",   col_b),
+    # ── SECTION 4: Zone 3 East vs West deep-dive ─────────────────────────────
+    st.subheader("4 — Zone 3 East vs Zone 3 West: detailed breakdown")
+
+    _z3e_df = _za[(_za["dropoff_zone"] == 3) & (_za["dropoff_side"] == "East")].copy()
+    _z3w_df = _za[(_za["dropoff_zone"] == 3) & (_za["dropoff_side"] == "West")].copy()
+
+    # Recovery rate = % of NEXT trips that pick up in Zone 1 or 2
+    def _recovery_rate(df):
+        """% of next pickups in Zone 1/2 (high-demand zone)."""
+        if df.empty or "next_pickup" not in df.columns:
+            return 0
+        _nxt = df.dropna(subset=["next_pickup"]).copy()
+        if _nxt.empty:
+            return 0
+        _nxt_pz = [assign_zone(lat, lon) for lat, lon in zip(_nxt["plat"], _nxt["plon"])]
+        return round(sum(1 for z in _nxt_pz if z and z <= 2) / max(len(_nxt_pz), 1) * 100, 1)
+
+    def _stuck_pct(df):
+        _g = df["gap_after"].dropna()
+        return round((((_g >= 25) & (_g <= 75)).sum()) / max(len(_g), 1) * 100, 1)
+
+    _east_stats = {
+        "Trips dropped here":    len(_z3e_df),
+        "Avg gap after":         f"{_z3e_df['gap_after'].mean():.1f} min" if not _z3e_df.empty else "—",
+        "Median gap after":      f"{_z3e_df['gap_after'].median():.1f} min" if not _z3e_df.empty else "—",
+        "Stuck rate (25-75 min)":f"{_stuck_pct(_z3e_df):.1f}%",
+        "Avg fare for that trip":f"£{_z3e_df['fare'][_z3e_df['fare']>0].mean():.2f}" if (_z3e_df["fare"]>0).any() else "—",
+        "Recovery to Z1/Z2":     f"{_recovery_rate(_z3e_df):.1f}%",
+    }
+    _west_stats = {
+        "Trips dropped here":    len(_z3w_df),
+        "Avg gap after":         f"{_z3w_df['gap_after'].mean():.1f} min" if not _z3w_df.empty else "—",
+        "Median gap after":      f"{_z3w_df['gap_after'].median():.1f} min" if not _z3w_df.empty else "—",
+        "Stuck rate (25-75 min)":f"{_stuck_pct(_z3w_df):.1f}%",
+        "Avg fare for that trip":f"£{_z3w_df['fare'][_z3w_df['fare']>0].mean():.2f}" if (_z3w_df["fare"]>0).any() else "—",
+        "Recovery to Z1/Z2":     f"{_recovery_rate(_z3w_df):.1f}%",
+    }
+
+    _s4c1, _s4c2 = st.columns(2)
+    for _col, _lbl, _color, _stats in [
+        (_s4c1, "ZONE 3 EAST", "#ef4444", _east_stats),
+        (_s4c2, "ZONE 3 WEST", "#3b82f6", _west_stats),
     ]:
-        grp = df_side.groupby("dropoff_zone").size().reset_index(name="trips")
-        grp["pct"] = (grp["trips"] / grp["trips"].sum() * 100).round(1)
-        grp["zone_label"] = "Zone " + grp["dropoff_zone"].astype(str)
-        fig = px.bar(grp.sort_values("dropoff_zone"), x="zone_label", y="pct",
-                     color="pct", color_continuous_scale=cscale,
-                     text="pct", title=title,
-                     labels={"zone_label": "Dropoff Zone", "pct": "% of trips"})
-        fig.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-        fig.update_layout(height=340, coloraxis_showscale=False)
-        col.plotly_chart(fig, use_container_width=True)
-
-    st.info(
-        f"📌 **Short Zone 1 hops are being filtered out.** "
-        f"{z1_local_dec:.0f}% of declined Z1 pickups stay within Zone 1 (short hop), "
-        f"vs only {z1_local_acc:.0f}% of accepts. "
-        f"They wait for trips that pull them out into longer-paying zones."
-    )
-
-    # ── SECTION 2: Distance and fare buckets ─────────────────────────────────
-    st.divider()
-    st.subheader("2 — Accepted trips are longer and higher value")
-
-    z1_pickup["distance_bucket"] = pd.cut(
-        z1_pickup["distance_in_miles"],
-        bins=[0, 2, 4, 7, 60],
-        labels=["Short (0-2 mi)", "Medium (2-4 mi)", "Long (4-7 mi)", "Very long (7+ mi)"],
-    )
-    bucket_totals = z1_pickup.groupby("outcome", observed=True).size().reset_index(name="total")
-    dist_grp = (
-        z1_pickup.groupby(["distance_bucket", "outcome"], observed=True)
-        .size().reset_index(name="trips")
-        .merge(bucket_totals, on="outcome")
-    )
-    dist_grp["pct"] = (dist_grp["trips"] / dist_grp["total"] * 100).round(1)
-
-    fig_dist = px.bar(
-        dist_grp, x="distance_bucket", y="pct", color="outcome", barmode="group",
-        color_discrete_map={"Accepted": "#22c55e", "Declined": "#ef4444"},
-        text="pct",
-        title="Zone 1 pickup trips — distance profile: accepted vs declined",
-        labels={"distance_bucket": "Trip Distance", "pct": "% of that outcome", "outcome": ""},
-    )
-    fig_dist.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-    fig_dist.update_layout(height=360, legend=dict(orientation="h", y=-0.25))
-    st.plotly_chart(fig_dist, use_container_width=True)
-
-    # Fare buckets (Bolt hides fare, so many declined trips will have £0 — show only non-zero)
-    z1_fare = z1_pickup[z1_pickup["trip_price_in_pound"] > 0].copy()
-    z1_fare["fare_bucket"] = pd.cut(
-        z1_fare["trip_price_in_pound"],
-        bins=[0, 8, 15, 25, 9999],
-        labels=["Low (£0–8)", "Medium (£8–15)", "High (£15–25)", "Premium (£25+)"],
-    )
-    fare_totals = z1_fare.groupby("outcome", observed=True).size().reset_index(name="total")
-    fare_grp = (
-        z1_fare.groupby(["fare_bucket", "outcome"], observed=True)
-        .size().reset_index(name="trips")
-        .merge(fare_totals, on="outcome")
-    )
-    fare_grp["pct"] = (fare_grp["trips"] / fare_grp["total"] * 100).round(1)
-
-    fig_fare = px.bar(
-        fare_grp, x="fare_bucket", y="pct", color="outcome", barmode="group",
-        color_discrete_map={"Accepted": "#22c55e", "Declined": "#ef4444"},
-        text="pct",
-        title="Zone 1 pickup trips — fare profile: accepted vs declined (Bolt fares estimated where hidden)",
-        labels={"fare_bucket": "Fare Band", "pct": "% of that outcome", "outcome": ""},
-    )
-    fig_fare.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-    fig_fare.update_layout(height=360, legend=dict(orientation="h", y=-0.25))
-    st.plotly_chart(fig_fare, use_container_width=True)
-
-    dist_uplift = ((avg_dist_acc / avg_dist_dec) - 1) * 100 if avg_dist_dec else 0
-    st.info(
-        f"📌 Accepted Zone 1 trips average **{avg_dist_acc:.1f} miles** vs "
-        f"**{avg_dist_dec:.1f} miles** for declined — {dist_uplift:.0f}% longer. "
-        f"They're effectively using distance as a proxy for trip value (Bolt hides fare, "
-        f"but a longer route = higher payout)."
-    )
-
-    # ── SECTION 3: Hour-by-hour acceptance rate ───────────────────────────────
-    st.divider()
-    st.subheader("3 — When are they most selective in Zone 1?")
-
-    z1_hourly = (
-        z1_pickup.groupby(["hour", "outcome"])
-        .size().reset_index(name="trips")
-    )
-    z1_total_hr = z1_pickup.groupby("hour").size().reset_index(name="total")
-    z1_hourly = z1_hourly.merge(z1_total_hr, on="hour")
-    z1_hourly["pct"] = (z1_hourly["trips"] / z1_hourly["total"] * 100).round(1)
-
-    z1_rate = (
-        z1_pickup.groupby(["hour", "outcome"])
-        .size().unstack(fill_value=0)
-        .reset_index()
-    )
-    z1_rate.columns.name = None
-    if "Accepted" in z1_rate.columns and "Declined" in z1_rate.columns:
-        z1_rate["accept_rate"] = (
-            z1_rate["Accepted"] /
-            (z1_rate["Accepted"] + z1_rate["Declined"]) * 100
-        ).round(1)
-        mean_rate = z1_rate["accept_rate"].mean()
-
-        fig_hr = px.line(
-            z1_rate, x="hour", y="accept_rate", markers=True,
-            title="Zone 1 pickup acceptance rate by hour of day",
-            labels={"hour": "Hour of Day", "accept_rate": "Acceptance Rate %"},
+        _rows3 = "".join(
+            f'<tr><td style="padding:5px 0;color:#94a3b8;font-size:12px;">{k}</td>'
+            f'<td style="text-align:right;font-weight:bold;color:#f8fafc;font-size:13px;">{v}</td></tr>'
+            for k, v in _stats.items()
         )
-        fig_hr.update_layout(height=320, xaxis=dict(dtick=1, range=[0, 23]))
-        fig_hr.add_hline(y=mean_rate, line_dash="dash", line_color="#f59e0b",
-                         annotation_text=f"avg {mean_rate:.0f}%",
-                         annotation_position="top right")
-        st.plotly_chart(fig_hr, use_container_width=True)
-
-    # ── SECTION 4: Zone 1 DROPOFF trips (inbound) ────────────────────────────
-    st.divider()
-    st.subheader("4 — Zone 1 dropoffs: which inbound trips do they take?")
-    st.caption("These are trips that END in Zone 1 — great for repositioning back into the high-density area.")
-
-    z1_in_acc = z1_dropoff[z1_dropoff["outcome"] == "Accepted"]
-    z1_in_dec = z1_dropoff[z1_dropoff["outcome"] == "Declined"]
-
-    col_c, col_d = st.columns(2)
-    for df_side, title, cscale, col in [
-        (z1_in_acc, "✅ Accepted inbound — pickup zone", "Greens", col_c),
-        (z1_in_dec, "❌ Declined inbound — pickup zone", "Reds",   col_d),
-    ]:
-        grp = df_side.groupby("pickup_zone").size().reset_index(name="trips")
-        grp["pct"] = (grp["trips"] / grp["trips"].sum() * 100).round(1)
-        grp["zone_label"] = "Zone " + grp["pickup_zone"].astype(str)
-        fig = px.bar(grp.sort_values("pickup_zone"), x="zone_label", y="pct",
-                     color="pct", color_continuous_scale=cscale,
-                     text="pct", title=title,
-                     labels={"zone_label": "Pickup Zone", "pct": "% of trips"})
-        fig.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-        fig.update_layout(height=340, coloraxis_showscale=False)
-        col.plotly_chart(fig, use_container_width=True)
-
-    # Compare accept rate by pickup zone for Z1 dropoffs
-    z1_inbound_rate = (
-        z1_dropoff.groupby(["pickup_zone", "outcome"])
-        .size().unstack(fill_value=0).reset_index()
-    )
-    z1_inbound_rate.columns.name = None
-    if "Accepted" in z1_inbound_rate.columns and "Declined" in z1_inbound_rate.columns:
-        z1_inbound_rate["accept_rate"] = (
-            z1_inbound_rate["Accepted"] /
-            (z1_inbound_rate["Accepted"] + z1_inbound_rate["Declined"]) * 100
-        ).round(1)
-        z1_inbound_rate["zone_label"] = "Zone " + z1_inbound_rate["pickup_zone"].astype(str)
-        fig_inr = px.bar(
-            z1_inbound_rate.sort_values("pickup_zone"),
-            x="zone_label", y="accept_rate",
-            color="accept_rate", color_continuous_scale="RdYlGn",
-            text="accept_rate",
-            title="Acceptance rate for trips dropping in Zone 1 — by pickup zone",
-            labels={"zone_label": "Pickup Zone", "accept_rate": "Accept Rate %"},
+        _col.markdown(
+            f'<div style="background:#1e1e2e;border:2px solid {_color};border-radius:8px;padding:14px 16px;">'
+            f'<div style="color:{_color};font-size:11px;font-weight:bold;letter-spacing:1px;margin-bottom:8px;">{_lbl}</div>'
+            f'<table style="width:100%;border-collapse:collapse;">{_rows3}</table></div>',
+            unsafe_allow_html=True,
         )
-        fig_inr.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-        fig_inr.update_layout(height=320, coloraxis_showscale=False)
-        st.plotly_chart(fig_inr, use_container_width=True)
 
-    st.info(
-        "📌 **Any trip ending in Zone 1 is positioning value.** "
-        "Even a long ride from Zone 5 that drops in Zone 1 is accepted — it puts the driver "
-        "back in the highest-density ping area. The inbound acceptance rate should be "
-        "consistently higher across all pickup zones."
-    )
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── SECTION 5: Area breakdown (from parquet pickup_address) ─────────────
+    # Gap distribution: Z3 East vs West
+    _z3_both = _za[_za["dropoff_zone"] == 3].dropna(subset=["gap_after"]).copy()
+    if not _z3_both.empty:
+        _fig_z3hist = px.histogram(
+            _z3_both, x="gap_after", color="dropoff_side",
+            barmode="overlay",
+            color_discrete_map={"East": "#ef4444", "West": "#3b82f6"},
+            nbins=30,
+            opacity=0.7,
+            title="Gap distribution — Zone 3 East vs West",
+            labels={"gap_after": "Gap after dropoff (min)", "dropoff_side": "Side"},
+            height=300,
+        )
+        _fig_z3hist.add_vline(x=25, line_dash="dash", line_color="#f59e0b", annotation_text="25 min")
+        _fig_z3hist.add_vline(x=75, line_dash="dash", line_color="#dc2626", annotation_text="75 min")
+        st.plotly_chart(_fig_z3hist, use_container_width=True)
+
     st.divider()
-    st.subheader("5 — Which specific areas within Zone 1 do they accept most?")
-    st.caption("Based on pickup address strings in the parquet — postcode district identifies the area.")
 
-    def _extract_london_area(address):
-        if not address or not isinstance(address, str):
-            return None
-        addr_upper = address.upper()
-        m = re.search(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?)\s+\d[A-Z]{2}\b', addr_upper)
-        if m:
-            district = m.group(1)
-            _MAP = {
-                "EC1": "City / Barbican",   "EC1A": "City / Barbican",  "EC1M": "City / Barbican",
-                "EC1N": "City / Barbican",  "EC1R": "City / Barbican",  "EC1V": "City / Barbican",
-                "EC1Y": "City / Barbican",
-                "EC2": "City / Bank",       "EC2A": "City / Bank",      "EC2M": "City / Bank",
-                "EC2N": "City / Bank",      "EC2R": "City / Bank",      "EC2V": "City / Bank",
-                "EC2Y": "City / Bank",
-                "EC3": "City / Aldgate",    "EC3A": "City / Aldgate",   "EC3M": "City / Aldgate",
-                "EC3N": "City / Aldgate",   "EC3R": "City / Aldgate",   "EC3V": "City / Aldgate",
-                "EC4": "City / Blackfriars","EC4A": "City / Blackfriars","EC4M": "City / Blackfriars",
-                "EC4N": "City / Blackfriars","EC4R": "City / Blackfriars","EC4V": "City / Blackfriars",
-                "EC4Y": "City / Blackfriars",
-                "WC1": "Holborn/Bloomsbury","WC1A": "Holborn/Bloomsbury","WC1B": "Holborn/Bloomsbury",
-                "WC1E": "Holborn/Bloomsbury","WC1H": "Holborn/Bloomsbury","WC1N": "Holborn/Bloomsbury",
-                "WC1R": "Holborn/Bloomsbury","WC1V": "Holborn/Bloomsbury","WC1X": "Holborn/Bloomsbury",
-                "WC2": "Covent Garden/Strand","WC2A": "Covent Garden/Strand","WC2B": "Covent Garden/Strand",
-                "WC2E": "Covent Garden/Strand","WC2H": "Covent Garden/Strand","WC2N": "Covent Garden/Strand",
-                "WC2R": "Covent Garden/Strand",
-                "W1A": "Mayfair/Oxford St", "W1B": "Mayfair/Oxford St", "W1C": "Mayfair/Oxford St",
-                "W1D": "Soho",              "W1F": "Soho",              "W1G": "Marylebone",
-                "W1H": "Marylebone",        "W1J": "Mayfair/Oxford St", "W1K": "Mayfair/Oxford St",
-                "W1S": "Mayfair/Oxford St", "W1T": "Soho",              "W1U": "Marylebone",
-                "W1W": "Fitzrovia",
-                "SW1A": "Westminster",      "SW1E": "Westminster",      "SW1H": "Westminster",
-                "SW1P": "Westminster",      "SW1V": "Pimlico/Victoria", "SW1W": "Belgravia",
-                "SW1X": "Belgravia",        "SW1Y": "St James's",
-                "SE1": "Southwark/Waterloo",
-                "N1": "Islington/Angel",
-                "E1": "Whitechapel/Aldgate East",
-                "E1W": "Wapping",
-            }
-            mapped = _MAP.get(district)
-            if mapped:
-                return mapped
-            if district.startswith(("EC", "WC", "W1", "SW1", "SE1")):
-                return district
-        _KEYWORDS = [
-            ("MAYFAIR", "Mayfair/Oxford St"),        ("SOHO", "Soho"),
-            ("COVENT GARDEN", "Covent Garden/Strand"),("WESTMINSTER", "Westminster"),
-            ("VICTORIA", "Pimlico/Victoria"),         ("BELGRAVIA", "Belgravia"),
-            ("ST JAMES", "St James's"),               ("WATERLOO", "Southwark/Waterloo"),
-            ("SOUTHWARK", "Southwark/Waterloo"),      ("HOLBORN", "Holborn/Bloomsbury"),
-            ("BLOOMSBURY", "Holborn/Bloomsbury"),     ("STRAND", "Covent Garden/Strand"),
-            ("ISLINGTON", "Islington/Angel"),         ("ANGEL", "Islington/Angel"),
-            ("SHOREDITCH", "City / Bank"),            ("CITY OF LONDON", "City / Bank"),
-            ("BARBICAN", "City / Barbican"),          ("ALDGATE", "City / Aldgate"),
-            ("MARYLEBONE", "Marylebone"),             ("FITZROVIA", "Fitzrovia"),
-            ("WHITECHAPEL", "Whitechapel/Aldgate East"),
-        ]
-        for keyword, label in _KEYWORDS:
-            if keyword in addr_upper:
-                return label
-        return None
+    # ── SECTION 5: Worst Zone 3 East offenders ───────────────────────────────
+    st.subheader("5 — Drivers most frequently ending up in Zone 3 East")
+    st.caption("Ranked by what % of their drops land in Zone 3 East. These are the drivers to have a conversation with.")
 
-    # Use the parquet directly — pickup_address is now included in the file
-    if "pickup_address" not in flow.columns:
-        st.warning("pickup_address not in parquet — re-run `python build_flow.py` to rebuild with addresses.")
+    _drv_z3e = (
+        _za.groupby("dim_driver_id")
+        .apply(lambda g: pd.Series({
+            "name":       g["driver_full_name"].dropna().iloc[0] if not g["driver_full_name"].dropna().empty else str(g["dim_driver_id"].iloc[0]),
+            "total_drops":len(g),
+            "z3e_drops":  int(((g["dropoff_zone"] == 3) & (g["dropoff_side"] == "East")).sum()),
+            "avg_gap_z3e": g.loc[(g["dropoff_zone"]==3) & (g["dropoff_side"]=="East"), "gap_after"].mean(),
+        }))
+        .reset_index(drop=True)
+    )
+    _drv_z3e["z3e_pct"] = (_drv_z3e["z3e_drops"] / _drv_z3e["total_drops"] * 100).round(1)
+    _drv_z3e = _drv_z3e[_drv_z3e["z3e_drops"] >= 3].sort_values("z3e_pct", ascending=False).head(20)
+
+    if not _drv_z3e.empty:
+        _drv_z3e["avg_gap_z3e"] = _drv_z3e["avg_gap_z3e"].fillna(0).round(1)
+        _fig_off = px.bar(
+            _drv_z3e, x="z3e_pct", y="name", orientation="h",
+            color="avg_gap_z3e",
+            color_continuous_scale=["#22c55e","#f59e0b","#ef4444"],
+            text="z3e_pct",
+            title="Zone 3 East drop rate per driver (min. 3 trips there)",
+            labels={"z3e_pct": "% of drops in Z3 East", "name": "Driver", "avg_gap_z3e": "Avg gap after (min)"},
+            height=max(320, len(_drv_z3e) * 26 + 80),
+        )
+        _fig_off.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        _fig_off.update_layout(
+            xaxis_title="% of all drops in Zone 3 East",
+            yaxis={"categoryorder": "total ascending"},
+            coloraxis_colorbar=dict(title="Avg gap (min)"),
+        )
+        st.plotly_chart(_fig_off, use_container_width=True)
+
+        # Table version
+        _off_tbl = _drv_z3e.copy()
+        _off_tbl["Z3E drops"]      = _off_tbl["z3e_drops"].astype(int)
+        _off_tbl["% of their drops"] = _off_tbl["z3e_pct"].apply(lambda x: f"{x:.1f}%")
+        _off_tbl["Avg gap after"]  = _off_tbl["avg_gap_z3e"].apply(lambda x: f"{x:.0f} min" if x else "—")
+        st.dataframe(
+            _off_tbl[["name","Z3E drops","% of their drops","Avg gap after"]].rename(columns={"name":"Driver"}),
+            use_container_width=True, hide_index=True,
+        )
     else:
-        z1_addr = flow[
-            (flow["pickup_zone"] == 1) &
-            flow["pickup_address"].notna() &
-            (flow["pickup_address"].astype(str).str.strip() != "")
-        ].copy()
-        z1_addr["area"] = z1_addr["pickup_address"].apply(_extract_london_area)
-        z1_addr = z1_addr[z1_addr["area"].notna()]
-
-        if z1_addr.empty:
-            st.warning("pickup_address column is present but empty for Zone 1 trips — may not be populated in DB.")
-        else:
-            area_pivot = (
-                z1_addr.groupby(["area", "outcome"])
-                .size().unstack(fill_value=0).reset_index()
-            )
-            area_pivot.columns.name = None
-            if "Accepted" not in area_pivot.columns:
-                area_pivot["Accepted"] = 0
-            if "Declined" not in area_pivot.columns:
-                area_pivot["Declined"] = 0
-            area_pivot["total"]       = area_pivot["Accepted"] + area_pivot["Declined"]
-            area_pivot["accept_rate"] = (
-                area_pivot["Accepted"] / area_pivot["total"] * 100
-            ).round(1)
-            area_pivot = area_pivot[area_pivot["total"] >= 5].sort_values("accept_rate", ascending=False)
-
-            col_e, col_f = st.columns(2)
-            with col_e:
-                fig_area = px.bar(
-                    area_pivot.head(15).sort_values("accept_rate"),
-                    x="accept_rate", y="area", orientation="h",
-                    color="accept_rate", color_continuous_scale="RdYlGn",
-                    text="accept_rate",
-                    title="Acceptance rate by Zone 1 pickup area",
-                    labels={"area": "", "accept_rate": "Accept Rate %"},
-                )
-                fig_area.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-                fig_area.update_layout(height=max(350, len(area_pivot.head(15)) * 28),
-                                       coloraxis_showscale=False)
-                st.plotly_chart(fig_area, use_container_width=True)
-
-            with col_f:
-                fig_vol = px.bar(
-                    area_pivot.sort_values("total", ascending=False).head(15),
-                    x="total", y="area", orientation="h",
-                    text="total",
-                    title="Zone 1 ping volume by area (all pings offered)",
-                    labels={"area": "", "total": "Total pings"},
-                )
-                fig_vol.update_traces(texttemplate="%{text}", textposition="outside",
-                                      marker_color="#6366f1")
-                fig_vol.update_layout(height=max(350, len(area_pivot.head(15)) * 28))
-                st.plotly_chart(fig_vol, use_container_width=True)
-
-            display_tbl = area_pivot[["area", "Accepted", "Declined", "total", "accept_rate"]].rename(
-                columns={"area": "Area", "total": "Total Pings", "accept_rate": "Accept Rate %"}
-            ).sort_values("Accept Rate %", ascending=False).reset_index(drop=True)
-            st.dataframe(display_tbl, use_container_width=True, hide_index=True)
-
-            area_metrics = (
-                z1_addr[z1_addr["outcome"] == "Accepted"]
-                .groupby("area")
-                .agg(
-                    avg_fare=("trip_price_in_pound", lambda x: x[x > 0].mean()),
-                    avg_dist=("distance_in_miles", "mean"),
-                    trips=("outcome", "count"),
-                ).round(2).reset_index()
-                .rename(columns={"area": "Area", "avg_fare": "Avg Fare £",
-                                 "avg_dist": "Avg Distance mi", "trips": "Accepted Trips"})
-                .sort_values("Avg Fare £", ascending=False)
-            )
-            st.markdown("**Accepted trips per area — avg fare and distance**")
-            st.dataframe(area_metrics, use_container_width=True, hide_index=True)
-
-# ── Zone 1: The Why ───────────────────────────────────────────────────────────
-elif page == "Zone 1: The Why":
-    st.title("Zone 1: The Why")
-    st.caption("Why do the top 10 drivers decline Zone 1→Zone 1 short hops more than any other trip type — and why does it make them more money?")
-
-    st.markdown("""
-<style>
-.why-card {
-    background: #1a1a2e;
-    border-left: 4px solid #f59e0b;
-    border-radius: 8px;
-    padding: 18px 22px;
-    margin-bottom: 16px;
-}
-.why-title { color: #f59e0b; font-size: 15px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
-.why-body  { color: #d1d5db; font-size: 14px; line-height: 1.7; }
-.coaching-card {
-    background: #052e16;
-    border-left: 4px solid #22c55e;
-    border-radius: 8px;
-    padding: 18px 22px;
-    margin-top: 8px;
-}
-.coaching-title { color: #22c55e; font-size: 15px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
-.coaching-body  { color: #d1d5db; font-size: 14px; line-height: 1.7; }
-</style>
-""", unsafe_allow_html=True)
-
-    # ── Key numbers strip ─────────────────────────────────────────────────────
-    st.subheader("The numbers behind the behaviour")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Z1→Z1 avg speed",        "6.2 mph",   "Gridlock pace")
-    c2.metric("Z1→Z6 avg speed",        "19.3 mph",  "3× faster roads")
-    c3.metric("Z1→Z1 full-cycle RPH",   "£20.25/hr", "Below fleet avg £22.9")
-    c4.metric("Z1→Z6 full-cycle RPH",   "£30.98/hr", "+35% above fleet avg")
-    c5.metric("Difference per hour",    "+£10.73/hr", "From being selective")
+        st.info("Not enough Zone 3 East drop data to rank drivers.")
 
     st.divider()
 
-    # ── Reason 1 ─────────────────────────────────────────────────────────────
-    st.markdown("""
-<div class="why-card">
-<div class="why-title">1 — The speed trap: the meter doesn't fully compensate for gridlock</div>
-<div class="why-body">
-Both Uber and Bolt charge <strong>£1.25/mile + £0.15/minute</strong>. At Zone 1's 6.2 mph average, that translates to:
-<br><br>
-&nbsp;&nbsp;&nbsp;£0.15 × 60 min &nbsp;+ £1.25 × 6.2 mph &nbsp;= <strong>£9/hr time + £7.75/hr distance = £16.75/hr rate</strong>
-<br>
-&nbsp;&nbsp;&nbsp;vs. Zone 6 at 19 mph: £9/hr time + £23.75/hr distance = <strong>£32.75/hr rate</strong>
-<br><br>
-The per-minute rate (£9/hr) barely keeps pace with sitting in traffic. The per-mile rate — where the real money is — collapses
-at slow speed. The only thing saving short Zone 1 trips is the <strong>minimum fare floor</strong>, which is exactly why Zone 1→Zone 1
-has the highest fare-per-mile in our data (£7.17/mi). These are trips where the meter hit the floor before it could earn its
-natural rate. Minimum-fare trips are, by definition, the worst outcome.
-</div>
-</div>
-""", unsafe_allow_html=True)
-
-    # Speed-by-zone table
-    speed_df = pd.DataFrame({
-        "Pickup Zone": ["Zone 1", "Zone 2", "Zone 3", "Zone 4", "Zone 5", "Zone 6"],
-        "Avg Speed (mph)": [8.3, 10.4, 13.0, 15.5, 16.2, 19.3],
-        "Fare/mile rate (£)": [7.17, 4.97, 3.65, 3.08, 3.03, 2.74],
-        "Implied RPH (£/hr)": [37.90, 34.07, 33.46, 34.73, 42.24, 46.76],
-    })
-    fig_spd = px.bar(
-        speed_df, x="Pickup Zone", y="Avg Speed (mph)",
-        color="Avg Speed (mph)", color_continuous_scale="RdYlGn",
-        text="Avg Speed (mph)",
-        title="Average trip speed by pickup zone — Zone 1 is 3× slower than Zone 6",
-    )
-    fig_spd.update_traces(texttemplate="%{text:.1f} mph", textposition="outside")
-    fig_spd.update_layout(height=320, coloraxis_showscale=False)
-    st.plotly_chart(fig_spd, use_container_width=True)
-    st.caption("TomTom & TfL data confirm central London averages 7–9 mph. Our data shows Zone 1→Zone 1 short hops at 6.2 mph — the slowest segment in the dataset.")
-
-    st.divider()
-
-    # ── Reason 2 ─────────────────────────────────────────────────────────────
-    st.markdown("""
-<div class="why-card">
-<div class="why-title">2 — The full-cycle maths: Zone 1 short hops earn below the fleet average</div>
-<div class="why-body">
-Once you account for the full cycle — inter-trip wait + pickup time + ride time — the numbers
-look very different from the fare alone.
-<br><br>
-&nbsp;&nbsp;&nbsp;<strong>Z1→Z1 short hop:</strong> &nbsp;£11.52 fare &nbsp;÷&nbsp; (14 min wait + 5 min pickup + 21 min ride) / 60
-&nbsp;= <strong>£20.25/hr</strong> &nbsp;← below fleet average (£22.9/hr)
-<br><br>
-&nbsp;&nbsp;&nbsp;<strong>Z1→Z5/Z6 airport run:</strong> £41.27 fare ÷ (21 min wait + 11 min pickup + 59 min ride) / 60
-&nbsp;= <strong>£30.98/hr</strong> &nbsp;← 35% above fleet average
-<br><br>
-The short hop isn't just lower than the airport run — it's <em>below what a driver earns on average
-across their whole shift</em>. Every short Z1 hop accepted is a drag on the shift, not a contribution to it.
-</div>
-</div>
-""", unsafe_allow_html=True)
-
-    opp_df = pd.DataFrame({
-        "Strategy": ["Accept every Z1→Z1\nshort hop", "Fleet average\n(all zones)", "Pass short hops,\ntake airport runs"],
-        "Full-cycle RPH": [20.25, 22.9, 30.98],
-    })
-    fig_opp = px.bar(
-        opp_df, x="Strategy", y="Full-cycle RPH",
-        color="Full-cycle RPH", color_continuous_scale="RdYlGn",
-        text="Full-cycle RPH",
-        title="Full-cycle RPH (fare ÷ wait + pickup + ride): short hops drag you below average",
-        labels={"Full-cycle RPH": "£/hr", "Strategy": ""},
-    )
-    fig_opp.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
-    fig_opp.update_layout(height=340, coloraxis_showscale=False)
-    fig_opp.add_hline(y=22.9, line_dash="dash", line_color="orange",
-                      annotation_text="Fleet avg £22.9/hr", annotation_position="top right")
-    st.plotly_chart(fig_opp, use_container_width=True)
-
-    st.divider()
-
-    # ── Reason 3 ─────────────────────────────────────────────────────────────
-    st.markdown("""
-<div class="why-card">
-<div class="why-title">3 — They see the estimated fare and distance — and the maths doesn't add up</div>
-<div class="why-body">
-On Bolt, drivers see a <strong>rough estimated fare and the trip distance</strong> on the ping — not the full
-route map, but enough to make a quick judgement.
-<br><br>
-When a ping shows £7 for 0.8 miles in Zone 1, an experienced driver knows:
-<br>
-&nbsp;&nbsp;&nbsp;• Zone 1 traffic is 6.2 mph average
-<br>
-&nbsp;&nbsp;&nbsp;• 0.8 miles at 6.2 mph ≈ 8 minutes riding, plus ~5 min pickup = <strong>13 minutes for £7</strong>
-<br>
-&nbsp;&nbsp;&nbsp;• That's £32/hr ride-only, or roughly <strong>£20/hr full-cycle</strong> — below their average
-<br><br>
-Contrast with a £38 ping for 15 miles: even before doing the maths, <strong>high fare + long distance = accept</strong>.
-The fare and distance together are the signal. Short distance + low fare = the Zone 1 gridlock trap.
-<br><br>
-This makes the coaching rule very concrete: <strong>in Zone 1, the threshold a driver should hold out for
-is roughly £12+ fare or 2+ miles</strong>. Below that, the full-cycle maths puts you below your own shift average.
-</div>
-</div>
-""", unsafe_allow_html=True)
-
-    st.divider()
-
-    # ── Reason 4 ─────────────────────────────────────────────────────────────
-    st.markdown("""
-<div class="why-card">
-<div class="why-title">4 — The congestion charge is a fixed cost that short hops barely cover</div>
-<div class="why-body">
-The entire Zone 1 sits inside the Congestion Charge zone (£15/day in 2026).
-A driver working Zone 1 pays that overhead regardless of how many trips they take.
-<br><br>
-&nbsp;&nbsp;&nbsp;<strong>Short Z1→Z1 hop (£6–8):</strong> contributes ~£0.50–1 toward the daily charge overhead
-<br>
-&nbsp;&nbsp;&nbsp;<strong>Airport run from Z1 (£40–47):</strong> absorbs the full overhead in one trip and leaves margin
-<br><br>
-Every minimum-fare trip in the congestion zone is effectively a trip where a meaningful slice
-of earnings goes to TfL. Longer, higher-value trips amortise that cost far more efficiently.
-</div>
-</div>
-""", unsafe_allow_html=True)
-
-    st.divider()
-
-    # ── The accepted Z1→Z1 trips ─────────────────────────────────────────────
-    st.subheader("What about the 3,195 Zone 1→Zone 1 trips they DID accept?")
-    st.markdown("""
-The top drivers **do** accept Z1→Z1 trips — just not all of them. The ones they accept average **2.15 miles**.
-That's not a cross-street hop. That's Mayfair → The City, or Soho → Southwark — a meaningful intra-London route
-that happens to stay within Zone 1's polygon. At 2.15 miles and 21 minutes, the fare is £11.52 and the implied
-RPH is £37.90 — worth taking.
-
-The **declined** Z1→Z1 pings are almost certainly concentrated in the sub-1-mile bucket (576 trips in our distribution
-sit at 0.5–1 mile). Those are the tourist hops, the hotel-to-restaurant drops, the cross-street pickups that
-look small on Bolt's map and promise nothing but 15 minutes of Piccadilly Circus traffic.
-""")
-
-    dist_dist = pd.DataFrame({
-        "Distance band": ["Under 0.5 mi", "0.5–1 mi", "1–1.5 mi", "1.5–2 mi", "2–3 mi", "3–5 mi", "5+ mi"],
-        "Accepted Z1→Z1 trips": [79, 497, 712, 646, 664, 434, 163],
-    })
-    fig_dd = px.bar(
-        dist_dist, x="Distance band", y="Accepted Z1→Z1 trips",
-        color="Accepted Z1→Z1 trips", color_continuous_scale="Blues",
-        text="Accepted Z1→Z1 trips",
-        title="Accepted Zone 1→Zone 1 trips by distance — the very short ones are where declines cluster",
-    )
-    fig_dd.update_traces(texttemplate="%{text}", textposition="outside")
-    fig_dd.update_layout(height=320, coloraxis_showscale=False)
-    st.plotly_chart(fig_dd, use_container_width=True)
-
-    st.divider()
-
-    # ── Coaching rule ─────────────────────────────────────────────────────────
-    st.markdown("""
-<div class="coaching-card">
-<div class="coaching-title">The coaching rule this generates</div>
-<div class="coaching-body">
-Zone 1 is still the best place to be — highest ping density, shortest pickup wait (6.7 min).
-The mistake average drivers make is accepting <em>every</em> Zone 1 ping out of fear of being idle.
-Short Z1 hops pull the full-cycle RPH to <strong>£20.25/hr — below what they earn on average across
-their whole shift (£22.9/hr)</strong>. It's not just that they're missing airport runs; they're actively
-dragging their own average down.
-<br><br>
-<strong>The rule for drivers:</strong> In Zone 1, if the ping shows under ~£12 fare or under ~2 miles,
-the full-cycle maths puts that trip below your shift average. Pass and wait for the next ping.
-Zone 1 has the shortest wait for the next ping (6.7 min average) — the cost of passing is low.
-<br><br>
-<strong>The numbers to give drivers:</strong><br>
-— Full-cycle RPH accepting every Z1 short hop: <strong>£20.25/hr</strong> (below your average)<br>
-— Full-cycle RPH on Z1 airport runs: <strong>£30.98/hr</strong> (35% above your average)<br>
-— Difference: <strong>+£10.73/hr just from being selective on low-fare Z1 pings</strong>
-</div>
-</div>
-""", unsafe_allow_html=True)
-
-    st.divider()
-    st.caption("Sources: TomTom Traffic Index (London slowest city in Europe); TfL central London speed data (7.4 mph avg, 7am–7pm); Uber/Bolt London pricing: £2.50 base + £1.25/mile + £0.15/min; Congestion Charge Zone: £15/day (2026). Trip economics from Odysse fleet data.")
-
-# ── Trip Strategy DNA ─────────────────────────────────────────────────────────
-elif page == "Trip Strategy DNA":
-    st.title("Trip Strategy DNA")
-    st.caption("Do the top drivers stay in Zone 1 and chain short trips, or do they do long back-and-forth runs? Who's doing what — and what's actually working?")
-
-    with st.spinner("Loading trip sequences..."):
-        raw = db.load_zone_trips()
-        raw = raw[raw["dim_driver_id"].isin(selected_ids)].copy()
-        raw["display_name"] = raw["dim_driver_id"].map(DRIVER_NAMES).fillna(raw["driver_full_name"])
-
-    from zones import calc_true_rph as _calc_rph
-
-    enriched = enrich_zones(raw)
-    enriched = _calc_rph(enriched)
-    enriched = enriched.sort_values(["dim_driver_id","pickedup_trip_datetime"])
-
-    # Classify each trip's pickup context based on previous dropoff zone
-    enriched["prev_dzone"] = enriched.groupby("dim_driver_id")["dropoff_zone"].shift(1)
-
-    def _ctx(row):
-        if pd.isna(row["prev_dzone"]):  return "Shift start"
-        p, c = int(row["prev_dzone"]), int(row["pickup_zone"])
-        if c == 1 and p == 1:           return "Z1 chain"
-        if c == 1 and p >= 3:           return "Return to Z1 (empty reposition)"
-        if c == 1 and p == 2:           return "Z1 via Z2"
-        if c >= 3 and p == 1:           return "Left Z1 for outer zone"
-        return "Other"
-
-    enriched["context"] = enriched.apply(_ctx, axis=1)
-
-    # ── SECTION 1: What does each strategy actually earn? ────────────────────
-    st.subheader("1 — Which strategy earns more per hour?")
-    st.caption("Full-cycle RPH = fare ÷ (inter-trip gap + pickup time + ride time)")
-
-    ctx_summary = (
-        enriched[enriched["context"] != "Shift start"]
-        .groupby("context")
-        .agg(
-            trips=("true_rph", "count"),
-            avg_rph=("true_rph", "mean"),
-            avg_fare=("trip_price_in_pound", "mean"),
-            avg_dist=("distance_in_miles", "mean"),
-        ).round(2).reset_index()
-        .sort_values("avg_rph", ascending=False)
-    )
-
-    color_map = {
-        "Z1 chain":                    "#22c55e",
-        "Z1 via Z2":                   "#86efac",
-        "Other":                       "#6b7280",
-        "Left Z1 for outer zone":      "#f59e0b",
-        "Return to Z1 (empty reposition)": "#ef4444",
-    }
-
-    fig_ctx = px.bar(
-        ctx_summary, x="avg_rph", y="context", orientation="h",
-        color="context", color_discrete_map=color_map,
-        text="avg_rph",
-        title="Full-cycle RPH by trip sequence context",
-        labels={"context": "", "avg_rph": "Full-cycle RPH £/hr"},
-    )
-    fig_ctx.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
-    fig_ctx.add_vline(x=22.9, line_dash="dash", line_color="white",
-                      annotation_text="Fleet avg £22.9", annotation_position="top")
-    fig_ctx.update_layout(height=360, showlegend=False)
-    st.plotly_chart(fig_ctx, use_container_width=True)
-
-    st.info(
-        "📌 **Z1 chaining outperforms hub-and-spoke.** Returning to Zone 1 after a long outer run "
-        "(empty repositioning) produces the lowest RPH in the dataset — the dead miles kill the economics. "
-        "A Zone 1→Zone 6 airport run is great for that trip, but the empty return leg makes the "
-        "sequence average worse than just staying in Zone 1."
-    )
-    st.dataframe(
-        ctx_summary.rename(columns={
-            "context": "Sequence Context", "trips": "Trips",
-            "avg_rph": "Avg RPH £", "avg_fare": "Avg Fare £", "avg_dist": "Avg Distance mi"
-        }),
-        use_container_width=True, hide_index=True
-    )
-
-    # ── SECTION 2: Per-driver strategy profile ────────────────────────────────
-    st.divider()
-    st.subheader("2 — What is each driver actually doing?")
-
-    driver_profiles = []
-    for did, grp in enriched.groupby("dim_driver_id"):
-        if did not in selected_ids:
-            continue
-        name = DRIVER_NAMES.get(did, str(did))
-        total = len(grp)
-        z1 = grp[grp["pickup_zone"] == 1]
-        chains = grp[grp["context"] == "Z1 chain"]
-        returns = grp[grp["context"] == "Return to Z1 (empty reposition)"]
-        left_z1 = grp[grp["context"] == "Left Z1 for outer zone"]
-
-        driver_profiles.append({
-            "Driver": name,
-            "Total trips": total,
-            "Z1 pickup %": round(len(z1) / total * 100, 0),
-            "Z1→outer %": round((z1["dropoff_zone"] >= 3).sum() / len(z1) * 100, 0) if len(z1) else 0,
-            "Z1 chain trips": len(chains),
-            "Z1 chain RPH £": round(chains["true_rph"].mean(), 2) if len(chains) else 0,
-            "Reposition trips": len(returns),
-            "Reposition RPH £": round(returns["true_rph"].mean(), 2) if len(returns) else 0,
-            "Overall RPH £": round(grp["trip_price_in_pound"].sum() / (grp["gap_mins"].fillna(0).sum() +
-                             grp["pickup_duration_in_min"].fillna(0).sum() +
-                             grp["pob_duration_in_min"].sum()) * 60, 2),
-        })
-
-    prof_df = pd.DataFrame(driver_profiles).sort_values("Overall RPH £", ascending=False)
-    st.dataframe(prof_df, use_container_width=True, hide_index=True)
-
-    # Scatter: Z1 chain % vs overall RPH
-    prof_df["Z1 chain %"] = (prof_df["Z1 chain trips"] / prof_df["Total trips"] * 100).round(1)
-    fig_scatter = px.scatter(
-        prof_df, x="Z1 chain %", y="Overall RPH £",
-        text="Driver", size="Total trips",
-        color="Overall RPH £", color_continuous_scale="RdYlGn",
-        title="Zone 1 chaining intensity vs overall RPH — more chaining ≠ more earnings",
-        labels={"Z1 chain %": "% of trips that are Z1 chains", "Overall RPH £": "Overall RPH £/hr"},
-    )
-    fig_scatter.update_traces(textposition="top center")
-    fig_scatter.add_hline(y=prof_df["Overall RPH £"].mean(), line_dash="dash",
-                          line_color="orange", annotation_text="group avg")
-    fig_scatter.update_layout(height=420, coloraxis_showscale=False)
-    st.plotly_chart(fig_scatter, use_container_width=True)
-
-    # ── SECTION 3: The repositioning penalty visualised ───────────────────────
-    st.divider()
-    st.subheader("3 — The repositioning penalty: what a long trip sequence actually earns")
-    st.markdown("""
-A Zone 1→Zone 6 airport run earns **£30.98/hr for that trip**. But look at the full sequence:
-
-| Leg | Time | Earnings | RPH |
-|---|---|---|---|
-| Z1→Z6 trip (airport run) | 59 min ride + 11 min pickup | £41 | £30.98/hr |
-| Z6→Z1 empty reposition | ~40–50 min driving back | £0 | £0/hr |
-| Next Z1 pickup (now late, gap long) | Normal Z1 trip | £11-15 | Low |
-| **Sequence average** | **~150 min total** | **~£52** | **~£20.80/hr** |
-
-vs. staying in Zone 1:
-
-| Leg | Time | Earnings | RPH |
-|---|---|---|---|
-| Z1 trip × 3 | 3 × 40 min cycle | 3 × £12 = £36 | £22.36/hr |
-| **120 min total** | | **£36** | **£22.36/hr** |
-
-The airport run sequence *looks* like it should win, but the empty return leg turns a £31/hr trip into a £21/hr sequence.
-The only way the hub-and-spoke model beats Z1 chaining is if you can **pick up a return passenger at the outer zone** — avoiding the empty reposition entirely.
-""")
-
-    # ── SECTION 4: What should actually change ───────────────────────────────
-    st.divider()
-    st.subheader("4 — So what's the right model?")
-    st.markdown("""
-The data rules out two simple answers:
-
-**❌ "Just chain Zone 1 trips all day"** — Bal Jamts does this most (45% Z1, 1,737 chains) and has the lowest overall RPH. Chaining without selectivity on fare/distance just fills the shift with sub-£12 trips in gridlock.
-
-**❌ "Do long airport runs back and forth all day"** — the empty return leg produces £10–13/hr, which is worse than everything else. The sequence average comes out around £20–21/hr — the same as just chaining.
-
-**✅ What Marius Norvaisas (best overall RPH) actually does:**
-- Only 18% of trips from Zone 1 (doesn't camp there)
-- When he chains in Z1, he earns £25.92/hr on those chains — meaning he's being *selective* about which Z1 trips he takes
-- He takes long outer-zone trips but only when the return pick-up opportunity is real (Heathrow → passenger back to city)
-- He has the most trips of anyone (6,977) — high volume, spread across zones, not concentrated
-
-**The model that works:** Be in Zone 1 for high-density pings and fast turnarounds, accept Z1 trips that clear the £12 fare / 2 mile threshold, take long outer trips only when you can pick up a return passenger. Never reposition empty across more than one zone.
-""")
-
-# ── Airport Run Model ─────────────────────────────────────────────────────────
-elif page == "Airport Run Model":
-    st.title("Airport Run Model")
-    st.caption("Z1/Z2 base strategy + timed airport runs. Heathrow: quick daytime in-out. Gatwick: evening chain through south London.")
-
-    # ── Load data ────────────────────────────────────────────────────────────
-    with st.spinner("Loading trip data..."):
-        raw = db.load_zone_trips()
-        raw = raw[raw["dim_driver_id"].isin(selected_ids)].copy()
-
-    enriched = enrich_zones(raw)
-    enriched = enriched.sort_values(["dim_driver_id", "pickedup_trip_datetime"])
-    enriched["pickedup_trip_datetime"] = pd.to_datetime(enriched["pickedup_trip_datetime"])
-    enriched["dropoff_trip_datetime"]  = pd.to_datetime(enriched["dropoff_trip_datetime"])
-    enriched["pickup_zone"]  = enriched["pickup_zone"].astype(int)
-    enriched["dropoff_zone"] = enriched["dropoff_zone"].astype(int)
-
-    # Airport detection by coordinate bounding box (more precise than zone alone)
-    enriched["is_lhr"] = (
-        enriched["dropoff_lat"].between(51.45, 51.49) &
-        enriched["dropoff_lon"].between(-0.50, -0.42)
-    )
-    enriched["is_lgw"] = (
-        enriched["dropoff_lat"].between(51.13, 51.18) &
-        enriched["dropoff_lon"].between(-0.22, -0.14)
-    )
-    enriched["is_airport_drop"] = enriched["is_lhr"] | enriched["is_lgw"]
-    enriched["airport_name"] = np.where(
-        enriched["is_lhr"], "Heathrow (LHR)",
-        np.where(enriched["is_lgw"], "Gatwick (LGW)", "Other Zone 6")
-    )
-
-    enriched["next_pzone"]  = enriched.groupby("dim_driver_id")["pickup_zone"].shift(-1)
-    enriched["next_fare"]   = enriched.groupby("dim_driver_id")["trip_price_in_pound"].shift(-1)
-    enriched["next_pickup"] = enriched.groupby("dim_driver_id")["pickedup_trip_datetime"].shift(-1)
-    enriched["gap_to_next"] = (
-        enriched["next_pickup"] - enriched["dropoff_trip_datetime"]
-    ).dt.total_seconds().div(60)
-
-    airport_drops = enriched[enriched["is_airport_drop"]].copy()
-    lhr_drops     = enriched[enriched["is_lhr"]].copy()
-    lgw_drops     = enriched[enriched["is_lgw"]].copy()
-
-    # Classify what happens after the airport drop
-    def _return_type(row):
-        if pd.isna(row["next_pzone"]): return "End of shift"
-        z = int(row["next_pzone"])
-        if z >= 5: return "Got return passenger (Z5/Z6)"
-        if z <= 2: return "Repositioned empty to Z1/2"
-        return "Mid-zone pickup (Z3/4)"
-
-    airport_drops["return_type"] = airport_drops.apply(_return_type, axis=1)
-    lhr_drops["return_type"]     = lhr_drops.apply(_return_type, axis=1)
-    lgw_drops["return_type"]     = lgw_drops.apply(_return_type, axis=1)
-
-    # ── SECTION 1: Does it already work? ─────────────────────────────────────
-    st.subheader("1 — The top drivers are already doing this — 67% get a return passenger")
-
-    col1, col2, col3, col4 = st.columns(4)
-    got_return    = airport_drops[airport_drops["return_type"] == "Got return passenger (Z5/Z6)"]
-    repositioned  = airport_drops[airport_drops["return_type"] == "Repositioned empty to Z1/2"]
-    total_drops   = len(airport_drops)
-
-    col1.metric("Airport drops (total)",      f"{total_drops}")
-    col2.metric("Got return passenger",        f"{len(got_return)} ({len(got_return)/total_drops*100:.0f}%)", "Avg wait 20 min")
-    col3.metric("Avg return fare",             f"£{got_return['next_fare'].mean():.2f}")
-    col4.metric("Repositioned empty",          f"{len(repositioned)} ({len(repositioned)/total_drops*100:.0f}%)")
-
-    return_summary = (
-        airport_drops[airport_drops["return_type"] != "End of shift"]
-        .groupby("return_type")
-        .agg(
-            trips=("trip_price_in_pound", "count"),
-            avg_next_fare=("next_fare", "mean"),
-            avg_gap_mins=("gap_to_next", lambda x: x[x < 240].mean()),
-        ).round(1).reset_index()
-    )
-    color_map_rt = {
-        "Got return passenger (Z5/Z6)": "#22c55e",
-        "Mid-zone pickup (Z3/4)":       "#f59e0b",
-        "Repositioned empty to Z1/2":   "#ef4444",
-    }
-    fig_rt = px.pie(
-        return_summary, names="return_type", values="trips",
-        color="return_type", color_discrete_map=color_map_rt,
-        title="What happens after an airport drop?",
-    )
-    fig_rt.update_layout(height=340)
-    st.plotly_chart(fig_rt, use_container_width=True)
-
-    st.dataframe(
-        return_summary.rename(columns={
-            "return_type": "What happened next", "trips": "Trips",
-            "avg_next_fare": "Avg return fare £", "avg_gap_mins": "Avg wait (min)"
-        }),
-        use_container_width=True, hide_index=True
-    )
-
-    # ── SECTION 2: Economics of the paired run ────────────────────────────────
-    st.divider()
-    st.subheader("2 — The economics: paired airport run vs Z1 chaining")
-
-    # Airport drop leg
-    avg_drop_fare = airport_drops["trip_price_in_pound"].mean()
-    avg_drop_ride = airport_drops["pob_duration_in_min"].mean()
-    avg_drop_gap  = airport_drops["gap_mins"].mean() if "gap_mins" in airport_drops.columns else 15.0
-    avg_wait      = got_return["gap_to_next"][got_return["gap_to_next"] < 120].mean()
-    avg_ret_fare  = got_return["next_fare"].mean()
-    avg_ret_ride  = 55.0  # ~55 min return from Heathrow to Zone 1
-    avg_ret_pickup= 10.0
-
-    total_time_paired = avg_drop_gap + 10 + avg_drop_ride + avg_wait + avg_ret_pickup + avg_ret_ride
-    total_earn_paired = avg_drop_fare + avg_ret_fare
-    rph_paired        = total_earn_paired / (total_time_paired / 60)
-
-    # Z1 chaining for the same duration
-    z1_cycle = 40.5  # from earlier analysis (gap 14 + pickup 5 + ride 21)
-    z1_fare   = 11.52
-    n_z1_trips= total_time_paired / z1_cycle
-    rph_z1    = (n_z1_trips * z1_fare) / (total_time_paired / 60)
-
-    comparison_df = pd.DataFrame({
-        "Strategy": [
-            "Paired airport run (drop + return)",
-            "Z1 chaining (same window)",
-            "Airport run, empty return",
-        ],
-        "Total earnings": [round(total_earn_paired, 2), round(n_z1_trips * z1_fare, 2), round(avg_drop_fare, 2)],
-        "Time (min)":     [round(total_time_paired), round(total_time_paired), round(avg_drop_gap + 10 + avg_drop_ride + 45)],
-        "RPH":            [round(rph_paired, 2), round(rph_z1, 2), round(avg_drop_fare / ((avg_drop_gap + 10 + avg_drop_ride + 45) / 60), 2)],
-    })
-
-    fig_econ = px.bar(
-        comparison_df, x="Strategy", y="RPH",
-        color="RPH", color_continuous_scale="RdYlGn",
-        text="RPH",
-        title="Full-cycle RPH: paired airport run vs alternatives",
-        labels={"RPH": "£/hr", "Strategy": ""},
-    )
-    fig_econ.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
-    fig_econ.add_hline(y=22.9, line_dash="dash", line_color="orange",
-                       annotation_text="Fleet avg £22.9/hr", annotation_position="top right")
-    fig_econ.update_layout(height=380, coloraxis_showscale=False)
-    st.plotly_chart(fig_econ, use_container_width=True)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Paired run RPH",       f"£{rph_paired:.2f}/hr",  f"+£{rph_paired-22.9:.2f} vs fleet avg")
-    c2.metric("Z1 chaining RPH",      f"£{rph_z1:.2f}/hr",      "Baseline")
-    c3.metric("Empty return RPH",     f"£{avg_drop_fare/((avg_drop_gap+10+avg_drop_ride+45)/60):.2f}/hr", "Worst case")
-
-    # ── SECTION 3: When are drops happening vs optimal windows ───────────────
-    st.divider()
-    st.subheader("3 — When do drivers drop at airports now vs when they should")
-
-    hour_dist = airport_drops.groupby("trips_hr").size().reset_index(name="drops")
-
-    # Approximate big arrival windows at Heathrow
-    arrival_windows = pd.DataFrame({
-        "hour": [5, 6, 7, 8, 12, 13, 14, 15, 18, 19, 20],
-        "window_label": [
-            "Long-haul overnight (US/Asia)",
-            "Long-haul overnight (US/Asia)",
-            "Long-haul overnight (US/Asia)",
-            "Morning European peak",
-            "Transatlantic (East Coast)",
-            "Transatlantic (East Coast)",
-            "Transatlantic (East Coast)",
-            "Middle East / Gulf",
-            "Evening European",
-            "Evening European",
-            "Long-haul evening (US/Asia)",
-        ]
-    })
-
-    fig_hr = px.bar(
-        hour_dist, x="trips_hr", y="drops",
-        color="drops", color_continuous_scale="Blues",
-        text="drops",
-        title="Airport drops by hour of day (when drivers are currently going)",
-        labels={"trips_hr": "Hour", "drops": "Drops"},
-    )
-    fig_hr.update_traces(texttemplate="%{text}", textposition="outside")
-
-    # Shade arrival windows
-    for window_hour in [5, 6, 7, 12, 13, 14, 18, 19]:
-        fig_hr.add_vrect(
-            x0=window_hour - 0.4, x1=window_hour + 0.4,
-            fillcolor="rgba(34,197,94,0.15)", line_width=0,
-            annotation_text="Arrivals\nwindow" if window_hour == 6 else "",
-            annotation_position="top",
+    # ── SECTION 6: Where do drivers go AFTER Zone 3 East? ────────────────────
+    st.subheader("6 — Recovery: where does the next trip start after Zone 3?")
+    st.caption("After dropping in Zone 3 East, can drivers get back to Zone 1/2 quickly — or do they drift further out?")
+
+    _z3e_next = _za[((_za["dropoff_zone"] == 3) & (_za["dropoff_side"] == "East"))].copy()
+    _z3e_next = _z3e_next.dropna(subset=["next_pickup"])
+
+    if not _z3e_next.empty:
+        _z3e_next["next_pz"] = [assign_zone(lat, lon) for lat, lon in zip(_z3e_next["plat"], _z3e_next["plon"])]
+        _z3e_next_pz = _z3e_next["next_pz"].dropna().astype(int)
+        _next_zone_counts = _z3e_next_pz.value_counts().sort_index().reset_index()
+        _next_zone_counts.columns = ["Zone", "Count"]
+        _next_zone_counts["Zone label"] = "Zone " + _next_zone_counts["Zone"].astype(str)
+        _next_zone_counts["pct"] = (_next_zone_counts["Count"] / _next_zone_counts["Count"].sum() * 100).round(1)
+
+        _fig_nxt = px.bar(
+            _next_zone_counts, x="Zone label", y="pct",
+            color="Zone label",
+            color_discrete_map={f"Zone {i}": _color_z[i-1] for i in range(1,7)},
+            text="pct",
+            title="Next pickup zone after dropping in Zone 3 East",
+            labels={"pct": "% of next trips", "Zone label": ""},
+            height=320,
         )
+        _fig_nxt.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        _fig_nxt.update_layout(showlegend=False, yaxis_title="% of next trips")
+        st.plotly_chart(_fig_nxt, use_container_width=True)
 
-    fig_hr.update_layout(height=360, coloraxis_showscale=False, xaxis=dict(dtick=1))
-    st.plotly_chart(fig_hr, use_container_width=True)
-
-    st.info(
-        "📌 **Drops peak at 5–6am** — drivers are taking early departures passengers to the airport and "
-        "picking up overnight long-haul arrivals from the US/Middle East. "
-        "The **afternoon window (12–3pm)** — when transatlantic East Coast flights land — is significantly "
-        "underutilised. Flight data would let us identify and fill that gap deliberately."
-    )
-
-    # ── SECTION 4: The flight data integration plan ───────────────────────────
-    st.divider()
-    st.subheader("4 — The flight data integration")
-
-    st.markdown("""
-**What we need:**
-
-Heathrow has an official developer API (`developer.heathrow.com`) with real-time arrivals — free to register.
-Third-party options (AviationEdge, FlightLabs) also work and include aircraft type, which is the key field.
-
-**The model:**
-
-For each arriving flight at Heathrow, we want:
-- `scheduled_arrival` — when the wheels touch down
-- `aircraft_type` — determines passenger count
-  - A380: ~500 seats (Emirates, Qantas, British Airways)
-  - B777: ~350 seats (common long-haul)
-  - B787: ~290 seats
-  - A350: ~350 seats
-- `terminal` — T2, T3, T4, T5 (determines which arrivals bay to park at)
-- `origin` — long-haul from USA/Middle East/Asia = higher-value passengers
-
-**The timing calculation (driver leaves Zone 1 when?):**
-
-```
-pickup_window  = arrival_time + 45 min  (customs clearance estimate)
-drive_to_LHR   = 45 min from Zone 1 (off-peak) → 60 min (peak)
-depart_trigger = pickup_window - drive_to_LHR
-               = arrival_time + 45 - 50 = arrival_time - 5 min
-```
-
-So for a flight landing at 2:30pm:
-- Passengers through customs ≈ 3:15pm
-- Driver leaves Zone 1 at 2:25pm
-- Arrives Heathrow ≈ 3:10pm
-- Picks up at 3:15pm — perfect
-
-**Where this lives:**
-
-This notification goes into the **Driver Portal PWA** — the push notification system is already built (Phase 2 complete).
-The new trigger would be flight-based rather than stationary-position-based:
-
-> *"Big arrival window at Heathrow T5 in 45 min (Emirates EK003 — 496 seats). Leave now to match the pickup window."*
-
-The driver taps it, gets navigation to T5 arrivals. If they already have a departures passenger heading to Heathrow, even better — the drop + pick-up happens in one sequence.
-
-**Airports to cover:**
-- Heathrow (LHR) — primary daytime model, 20–25 min from Zone 1 off-peak. High-value pax, regular long-haul schedule.
-- Gatwick (LGW) — evening chain model only. Too far for a standalone run; only viable when the driver is already heading south through Z3/Z4. See Section 6.
-- Stansted (STN) — 50+ min from Zone 1, low priority, budget carriers only.
-""")
-
-    # ── SECTION 5: The recommended daily model ────────────────────────────────
-    st.divider()
-    st.subheader("5 — The recommended daily model")
-
-    model_df = pd.DataFrame({
-        "Time block": ["06:00–12:00", "12:00–14:00", "14:00–15:30", "15:30–18:00", "18:00–20:00", "20:00–23:00 (optional)"],
-        "Activity": [
-            "Z1/Z2 chaining — high ping density, £12+ threshold",
-            "Continue Z1/Z2 OR depart for Heathrow if afternoon arrival window (transatlantic landing)",
-            "Heathrow: drop departures + pick up arrivals passenger",
-            "Return to Z1/Z2 with arrivals passenger, resume chaining",
-            "Evening peak Z1/Z2 — accept south-bound pings if in Z3/Z4 territory",
-            "Gatwick chain (optional): south-bound through Z3/4 → Gatwick drop → overnight arrival pickup",
-        ],
-        "Expected RPH": ["£22/hr", "£22/hr or trigger", "£27/hr (paired)", "£27/hr (paired)", "£24/hr", "£26/hr (est.)"],
-    })
-    st.table(model_df)
-
-    st.success(
-        "**The key rule:** Never reposition to Heathrow empty. Only go if you have a departures "
-        "passenger heading that way, OR if the arrival window is large enough (300+ seat aircraft) "
-        "to justify the positioning cost. The data shows 67% of airport drops already produce a "
-        "return passenger — flight data should push that above 80% by targeting the right windows."
-    )
-
-    # ── SECTION 6: Gatwick — the evening chain ────────────────────────────────
-    st.divider()
-    st.subheader("6 — Gatwick: the evening chain model")
-    st.caption("Gatwick is 45 min south — too far to reposition for. But if a driver is already heading south dropping someone home, the economics change completely.")
-
-    col1, col2, col3, col4 = st.columns(4)
-    lgw_total    = len(lgw_drops)
-    lgw_return   = lgw_drops[lgw_drops["return_type"] == "Got return passenger (Z5/Z6)"]
-    lgw_empty    = lgw_drops[lgw_drops["return_type"] == "Repositioned empty to Z1/2"]
-
-    if lgw_total > 0:
-        col1.metric("Gatwick drops",          f"{lgw_total}")
-        col2.metric("Got return passenger",   f"{len(lgw_return)} ({len(lgw_return)/lgw_total*100:.0f}%)" if lgw_total > 0 else "–")
-        col3.metric("Avg return fare (LGW)",  f"£{lgw_return['next_fare'].mean():.2f}" if len(lgw_return) > 0 else "–")
-        col4.metric("Avg Gatwick drop fare",  f"£{lgw_drops['trip_price_in_pound'].mean():.2f}")
+        _back_z12 = _next_zone_counts[_next_zone_counts["Zone"] <= 2]["pct"].sum()
+        _stay_z3  = _next_zone_counts[_next_zone_counts["Zone"] == 3]["pct"].sum()
+        _further  = _next_zone_counts[_next_zone_counts["Zone"] > 3]["pct"].sum()
+        _r1, _r2, _r3 = st.columns(3)
+        _r1.metric("Recover to Z1/Z2",  f"{_back_z12:.1f}%", help="Good outcome")
+        _r2.metric("Stay in Zone 3",    f"{_stay_z3:.1f}%",  help="Neutral")
+        _r3.metric("Drift to Zone 4+",  f"{_further:.1f}%",  help="Bad outcome — gets worse")
     else:
-        col1.metric("Gatwick drops", "0")
-        col2.metric("Note", "No Gatwick trips in dataset")
-        col3.metric("LHR drops", f"{len(lhr_drops)}")
-        col4.metric("LHR return rate", f"{len(got_return)/max(len(lhr_drops),1)*100:.0f}%")
+        st.info("No Zone 3 East next-trip data found.")
 
-    # Evening pre-Gatwick chaining: are drivers passing through Z3/Z4 on the way?
-    # Trips that end at Gatwick — what was the previous trip's dropoff zone?
-    lgw_idx = lgw_drops.index
-    prev_zones = []
-    for idx in lgw_idx:
-        driver = lgw_drops.loc[idx, "dim_driver_id"]
-        driver_trips = enriched[enriched["dim_driver_id"] == driver].sort_values("pickedup_trip_datetime")
-        pos = driver_trips.index.get_loc(idx) if idx in driver_trips.index else -1
-        if pos > 0:
-            prev_zones.append(int(driver_trips.iloc[pos - 1]["dropoff_zone"]))
-
-    st.markdown("""
-**The Gatwick evening chain concept:**
-
-Gatwick sits directly south of central London — a driver heading from Zone 1/2 to Gatwick passes through Zone 3 (Brixton, Clapham, Streatham) and Zone 4 (Croydon, Sutton) on the way.
-
-The model:
-1. **18:00–20:00** — Z1/Z2 evening peak, take all trips going south or southeast
-2. **~20:00** — Pick up a departures passenger heading to Gatwick (naturally heading in the right direction)
-3. **20:30** — Arrive Gatwick. Wait for the overnight arrivals wave (Ryanair, EasyJet, TUI long-haul charters)
-4. **~21:30–23:00** — Pick up an arrivals passenger heading back to London (Zone 2–4)
-5. **Return** — 45+ mile return fare into the city
-
-**Why Gatwick is different from Heathrow:**
-
-| | Heathrow | Gatwick |
-|---|---|---|
-| Distance from Z1 | ~20 miles west | ~28 miles south |
-| Drive time (off-peak) | 40–50 min | 45–55 min |
-| Best return window | Morning long-haul arrivals | Evening charter/budget arrivals |
-| Typical return destination | Zone 1/2 (city centre) | Zone 2–4 (south London) |
-| Return fare (London) | £34 avg | £38–42 expected (longer trip) |
-
-**The key constraint:** Gatwick doesn't work for a quick daytime in-out run — it's too far and the arrivals are too unpredictable. The evening-to-overnight window (20:00–23:00) is when charter and long-haul budget flights land. The evening chain pattern — south-dropping pings from Zone 1 through Zone 3/4 toward Gatwick — is the way to make the repositioning cost free.
-
-**Driver Portal integration:**
-
-The Gatwick trigger would fire differently from Heathrow:
-> *"You're in Zone 3/4 heading south — Gatwick arrivals window opens in 60 min (TUI charter, 300 pax, landing 21:15). Accept south-bound pings only."*
-
-This is a harder product problem than Heathrow because the chain has to happen organically through south-bound trip routing, not a single departure decision.
-""")
-
-    if lgw_total > 0:
-        lgw_hour = lgw_drops.groupby("trips_hr").size().reset_index(name="drops")
-        fig_lgw = px.bar(
-            lgw_hour, x="trips_hr", y="drops",
-            title="Gatwick drops by hour (when drivers currently go)",
-            labels={"trips_hr": "Hour", "drops": "Drops"},
-            text="drops",
-        )
-        fig_lgw.update_traces(texttemplate="%{text}", textposition="outside")
-        fig_lgw.update_layout(height=300, xaxis=dict(dtick=1))
-        st.plotly_chart(fig_lgw, use_container_width=True)
-    else:
-        st.info(
-            "No Gatwick coordinate-matches in the current dataset — the 74 Gatwick drops from earlier analysis "
-            "may have been classified under the broader Zone 6 bucket. "
-            "The coordinate bounding box for Gatwick (lat 51.13–51.18, lon -0.22 to -0.14) can be adjusted if needed."
-        )
-
-    st.markdown("""
-**Verdict on Gatwick vs Heathrow:**
-
-Heathrow is the primary airport model — closer, higher passenger volumes, better daytime fit. Gatwick is viable as an **evening shift extension** for drivers who are already working south London in the evening. Don't ask daytime Z1/Z2 drivers to detour south for it — the repositioning cost kills the economics. But for a driver whose natural evening territory is Clapham → Croydon → Brixton, the Gatwick chain adds a high-fare anchor at the end of the shift.
-""")
-
-# ── Zone 3 Deep Dive ──────────────────────────────────────────────────────────
-elif page == "Zone 3 Deep Dive":
-    st.title("Zone 3 Deep Dive")
-    st.caption("Zone 3 has the worst average True RPH — but is it always a dead zone, or only at certain times?")
-
-    # Zone 3 trips by hour with raw RPH
-    z3_hour_data = pd.DataFrame([
-        {"hour": 0,  "trips":156, "avg_fare":13.20, "avg_dist":6.4, "avg_ride_mins":25},
-        {"hour": 1,  "trips":144, "avg_fare":13.00, "avg_dist":6.9, "avg_ride_mins":22},
-        {"hour": 2,  "trips":122, "avg_fare":14.20, "avg_dist":7.4, "avg_ride_mins":22},
-        {"hour": 3,  "trips": 91, "avg_fare":21.20, "avg_dist":11.3,"avg_ride_mins":30},
-        {"hour": 4,  "trips":157, "avg_fare":17.00, "avg_dist":11.1,"avg_ride_mins":30},
-        {"hour": 5,  "trips":205, "avg_fare":18.40, "avg_dist": 9.3,"avg_ride_mins":29},
-        {"hour": 6,  "trips":283, "avg_fare":17.90, "avg_dist": 8.2,"avg_ride_mins":31},
-        {"hour": 7,  "trips":233, "avg_fare":16.50, "avg_dist": 6.1,"avg_ride_mins":31},
-        {"hour": 8,  "trips":187, "avg_fare":14.30, "avg_dist": 5.5,"avg_ride_mins":27},
-        {"hour": 9,  "trips":223, "avg_fare":13.00, "avg_dist": 6.2,"avg_ride_mins":28},
-        {"hour":10,  "trips":216, "avg_fare":13.30, "avg_dist": 6.0,"avg_ride_mins":29},
-        {"hour":11,  "trips":202, "avg_fare":15.10, "avg_dist": 6.8,"avg_ride_mins":33},
-        {"hour":12,  "trips":173, "avg_fare":14.20, "avg_dist": 5.9,"avg_ride_mins":32},
-        {"hour":13,  "trips":184, "avg_fare":14.30, "avg_dist": 6.0,"avg_ride_mins":32},
-        {"hour":14,  "trips":191, "avg_fare":13.40, "avg_dist": 5.8,"avg_ride_mins":31},
-        {"hour":15,  "trips":236, "avg_fare":13.80, "avg_dist": 5.4,"avg_ride_mins":30},
-        {"hour":16,  "trips":286, "avg_fare":13.60, "avg_dist": 5.2,"avg_ride_mins":31},
-        {"hour":17,  "trips":265, "avg_fare":15.00, "avg_dist": 6.6,"avg_ride_mins":34},
-        {"hour":18,  "trips":328, "avg_fare":13.60, "avg_dist": 5.7,"avg_ride_mins":29},
-        {"hour":19,  "trips":353, "avg_fare":11.90, "avg_dist": 5.1,"avg_ride_mins":24},
-        {"hour":20,  "trips":279, "avg_fare":11.30, "avg_dist": 5.9,"avg_ride_mins":23},
-        {"hour":21,  "trips":251, "avg_fare":11.50, "avg_dist": 6.1,"avg_ride_mins":24},
-        {"hour":22,  "trips":263, "avg_fare":11.60, "avg_dist": 6.0,"avg_ride_mins":24},
-        {"hour":23,  "trips":160, "avg_fare":11.70, "avg_dist": 5.9,"avg_ride_mins":23},
-    ])
-    z3_hour_data["raw_rph"] = (z3_hour_data["avg_fare"] / (z3_hour_data["avg_ride_mins"]/60)).round(1)
-    z3_hour_data["period"] = z3_hour_data["hour"].apply(
-        lambda h: "Night (00-06)" if h < 6 else "Day (09-17)" if 9 <= h <= 17 else "Evening (17-23)" if h >= 17 else "Morning (06-09)"
-    )
-
-    # KPI comparison
-    night_rph = z3_hour_data[z3_hour_data["hour"] < 6]["raw_rph"].mean()
-    day_rph   = z3_hour_data[(z3_hour_data["hour"] >= 9) & (z3_hour_data["hour"] <= 17)]["raw_rph"].mean()
-    eve_rph   = z3_hour_data[z3_hour_data["hour"] >= 17]["raw_rph"].mean()
-    z1_rph    = 39.0  # from run_analysis
-
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Zone 3 — Night RPH",   f"£{night_rph:.0f}/hr", f"{'▲' if night_rph>z1_rph else '▼'} Zone 1 = £{z1_rph:.0f}/hr")
-    c2.metric("Zone 3 — Day RPH",     f"£{day_rph:.0f}/hr",   f"▼ {z1_rph-day_rph:.0f} below Zone 1")
-    c3.metric("Zone 3 — Evening RPH", f"£{eve_rph:.0f}/hr",   f"▼ {z1_rph-eve_rph:.0f} below Zone 1")
-    c4.metric("03:00 peak",           "£43/hr",                "Best single hour in Zone 3")
-
-    st.divider()
-
-    # Raw RPH by hour — bar coloured by whether it beats day average
-    z3_hour_data["colour"] = z3_hour_data["raw_rph"].apply(
-        lambda r: "Above £30 (worth it)" if r >= 30 else "£26–30 (borderline)" if r >= 26 else "Below £26 (avoid)"
-    )
-    fig_z3 = px.bar(z3_hour_data, x="hour", y="raw_rph",
-                    color="colour",
-                    color_discrete_map={"Above £30 (worth it)":"#22c55e",
-                                        "£26–30 (borderline)":"#f59e0b",
-                                        "Below £26 (avoid)":"#ef4444"},
-                    text="raw_rph",
-                    labels={"hour":"Hour of Day","raw_rph":"Raw RPH (fare ÷ ride time)"},
-                    title="Zone 3 — Raw RPH by Hour of Day")
-    fig_z3.add_hline(y=z1_rph, line_dash="dash", line_color="#3b82f6",
-                     annotation_text=f"Zone 1 avg (£{z1_rph:.0f}/hr)", annotation_position="top right")
-    fig_z3.update_traces(texttemplate="£%{text:.0f}", textposition="outside")
-    fig_z3.update_layout(height=440, showlegend=True,
-                         legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    st.plotly_chart(fig_z3, use_container_width=True)
-
-    st.info("📌 **Zone 3 verdict:**\n"
-            "- **00:00–06:00**: Earns £32–43/hr — **comparable to or better than Zone 1 Zone daytime**. Long trips (avg 11mi at 03:00) going back into the city.\n"
-            "- **09:00–17:00**: £26–28/hr + long waits (32min avg). This is the dead zone. Avoid.\n"
-            "- **17:00–23:00**: £27–30/hr. Moderate — better than daytime but Zone 1 or 2 still outperform.\n\n"
-            "**The problem isn't Zone 3. It's Zone 3 in the middle of the day.**")
-
-    st.divider()
-
-    # Fare vs distance scatter by hour
-    st.subheader("Fare vs Distance in Zone 3 — how does the trip quality change?")
-    fig_sc = px.scatter(z3_hour_data, x="avg_dist", y="avg_fare", size="trips",
-                        color="raw_rph", color_continuous_scale="RdYlGn",
-                        text="hour",
-                        labels={"avg_dist":"Avg Distance (mi)","avg_fare":"Avg Fare £",
-                                "raw_rph":"Raw RPH £","trips":"Trip Count"},
-                        title="Each dot = one hour of the day. Colour = Raw RPH. Size = trip volume.")
-    fig_sc.update_traces(textposition="top center")
-    fig_sc.update_layout(height=450)
-    st.plotly_chart(fig_sc, use_container_width=True)
-    st.caption("Night hours (top-right) = longer distance, higher fare, higher RPH. Day hours (bottom-left) = short, cheap, lots of volume but poor efficiency.")
-
-    st.divider()
-
-    # Zone 3 areas
-    st.subheader("Most common Zone 3 pickup areas")
-    areas = pd.DataFrame([
-        {"Area": "Walthamstow",  "Trips": 185, "Avg Fare £": 11.19},
-        {"Area": "Wandsworth",   "Trips": 155, "Avg Fare £": 13.36},
-        {"Area": "Stratford",    "Trips": 133, "Avg Fare £": 11.90},
-        {"Area": "Greenwich",    "Trips": 104, "Avg Fare £": 13.13},
-        {"Area": "Lewisham",     "Trips": 104, "Avg Fare £": 11.26},
-        {"Area": "Tottenham",    "Trips":  65, "Avg Fare £": 12.10},
-        {"Area": "East Ham",     "Trips":  61, "Avg Fare £": 11.07},
-        {"Area": "Ealing",       "Trips":  49, "Avg Fare £": 14.03},
-        {"Area": "Lambeth",      "Trips":  41, "Avg Fare £": 12.91},
-        {"Area": "Barnet",       "Trips":  38, "Avg Fare £": 13.20},
-        {"Area": "Brent",        "Trips":  33, "Avg Fare £": 13.82},
-        {"Area": "Enfield",      "Trips":  19, "Avg Fare £":  9.09},
-    ])
-    fig_a = px.bar(areas.sort_values("Avg Fare £", ascending=True),
-                   x="Avg Fare £", y="Area", orientation="h",
-                   color="Avg Fare £", color_continuous_scale="YlOrRd",
-                   text="Avg Fare £", size_max=40,
-                   labels={"Area":""},
-                   title="Avg Fare per Zone 3 Area — Ealing & Brent are the better Z3 pockets")
-    fig_a.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
-    fig_a.update_layout(coloraxis_showscale=False, height=400)
-    st.plotly_chart(fig_a, use_container_width=True)
-    st.caption("Enfield (£9.09) and Walthamstow/East Ham (£11) are the worst fare areas. Ealing, Brent, Wandsworth are the stronger Zone 3 pockets.")
-
-    # Zone 3 dropoff destinations
-    st.subheader("Where do Zone 3 trips end up?")
-    z3_dropoff = pd.DataFrame({
-        "Dropoff Zone": ["Zone 1","Zone 2","Zone 3","Zone 4","Zone 5","Zone 6"],
-        "Trips":        [727, 1251, 1943, 779, 316, 254],
-        "Pct":          [14,   24,   37,  15,   6,   5],
-    })
-    fig_do = px.bar(z3_dropoff, x="Dropoff Zone", y="Pct", color="Pct",
-                    color_continuous_scale="Blues", text="Pct",
-                    labels={"Pct":"% of Zone 3 trips"},
-                    title="Zone 3 trips — where they drop off")
-    fig_do.update_traces(texttemplate="%{text}%", textposition="outside")
-    fig_do.update_layout(coloraxis_showscale=False, height=360)
-    st.plotly_chart(fig_do, use_container_width=True)
-    st.caption("37% of Zone 3 trips stay in Zone 3 (local loop — low value). 14% go into Zone 1 (good, especially at night). 15% go outward to Zone 4+ (often airport adjacent).")
-
-# ── Overview ─────────────────────────────────────────────────────────────────
-elif page == "Overview":
-    st.title("Top 10 Driver Overview")
-    st.caption("Revenue per hour · All-time summary from performance data")
-
-    # KPI bar chart
-    fig = px.bar(
-        overview_filtered.sort_values("rph", ascending=True),
-        x="rph", y="display_name",
-        orientation="h",
-        color="rph",
-        color_continuous_scale="YlOrRd",
-        labels={"rph": "£ / hr (online)", "display_name": ""},
-        title="Revenue Per Hour (£)",
-        text="rph",
-    )
-    fig.update_traces(texttemplate="£%{text}", textposition="outside")
-    fig.update_layout(coloraxis_showscale=False, height=420, margin=dict(l=10, r=40, t=40, b=20))
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-
-    # Metrics table
-    st.subheader("Full Breakdown")
-    display_cols = {
-        "display_name": "Driver",
-        "active_days": "Days Active",
-        "total_rides": "Rides",
-        "total_online_hrs": "Online Hrs",
-        "rph": "£/hr",
-        "rev_per_trip": "£/trip",
-        "avg_util": "Util %",
-        "avg_rating": "Rating",
-        "avg_acceptance": "Accept %",
-        "total_revenue": "Revenue £",
-        "total_earnings": "Earnings £",
-    }
-    table = overview_filtered[list(display_cols.keys())].rename(columns=display_cols)
-    table = table.sort_values("£/hr", ascending=False)
-    st.dataframe(
-        table.style.background_gradient(subset=["£/hr", "Util %"], cmap="YlOrRd"),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    # Scatter: utilisation vs RPH
-    st.subheader("Utilisation vs Revenue Per Hour")
-    fig2 = px.scatter(
-        overview_filtered,
-        x="avg_util", y="rph",
-        size="total_rides", color="avg_rating",
-        hover_name="display_name",
-        color_continuous_scale="Viridis",
-        labels={"avg_util": "Avg Utilisation %", "rph": "£/hr", "avg_rating": "Rating", "total_rides": "Rides"},
-        size_max=40,
-    )
-    fig2.update_layout(height=420)
-    st.plotly_chart(fig2, use_container_width=True)
-
-# ── Map View ─────────────────────────────────────────────────────────────────
-elif page == "Map View":
-    st.title("Trip Map")
-    st.caption("Select a driver to see all their routes. Zone circles show approximate TfL zone boundaries.")
-
-    # Controls row
-    col_sel, col_n, col_src = st.columns([2, 1, 1])
-    with col_sel:
-        map_driver_name = st.selectbox("Driver", list(DRIVER_NAMES.values()))
-    with col_n:
-        trip_limit = st.selectbox("Show last N trips", [100, 250, 500, 1000], index=1)
-    with col_src:
-        show_zones = st.toggle("Show zone circles", value=True)
-
-    map_driver_id = [k for k, v in DRIVER_NAMES.items() if v == map_driver_name][0]
-
-    with st.spinner(f"Loading {trip_limit} trips for {map_driver_name}..."):
-        raw = db.load_map_trips(map_driver_id, limit=trip_limit)
-
-    if raw.empty:
-        st.warning("No trips found for this driver.")
-    else:
-        # Parse coordinates
-        raw = raw.copy()
-        coords = raw["pickup_lat_long"].apply(parse_dms)
-        raw["plat"] = [c[0] for c in coords]
-        raw["plon"] = [c[1] for c in coords]
-        dcoords = raw["dropoff_latlong"].apply(parse_dms)
-        raw["dlat"] = [c[0] for c in dcoords]
-        raw["dlon"] = [c[1] for c in dcoords]
-        raw["pickup_zone"] = raw.apply(lambda r: assign_zone(r.plat, r.plon), axis=1)
-        raw["dropoff_zone"] = raw.apply(lambda r: assign_zone(r.dlat, r.dlon), axis=1)
-        valid_mask = raw.apply(
-            lambda r: is_valid_london_trip(r.plat, r.plon, r.dlat, r.dlon), axis=1
-        )
-        valid = raw[valid_mask].copy()
-
-        # Stats strip
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Trips shown", len(valid))
-        m2.metric("Avg fare", f"£{valid['trip_price_in_pound'].mean():.2f}")
-        m3.metric("Avg distance", f"{valid['distance_in_miles'].mean():.1f} mi")
-        m4.metric("Avg pickup speed", f"{valid['pickup_duration_in_min'].mean():.1f} min")
-
-        # Build Folium map
-        centre = [valid["plat"].mean(), valid["plon"].mean()]
-        m = folium.Map(location=centre, zoom_start=11, tiles="CartoDB positron")
-
-        # TfL Zone polygons from GeoJSON
-        if show_zones:
-            zone_colours = {1: "#ef4444", 2: "#f97316", 3: "#eab308",
-                            4: "#22c55e", 5: "#3b82f6", 6: "#8b5cf6"}
-
-            def zone_style(feature):
-                z = feature["properties"]["zone"]
-                return {
-                    "color": zone_colours.get(z, "#9ca3af"),
-                    "weight": 2.5,
-                    "fillOpacity": 0.06,
-                    "fillColor": zone_colours.get(z, "#9ca3af"),
-                    "dashArray": "5,4" if z > 1 else None,
-                }
-
-            folium.GeoJson(
-                GEOJSON_DATA,
-                name="TfL Zones",
-                style_function=zone_style,
-                tooltip=folium.GeoJsonTooltip(fields=["zone", "description"], aliases=["Zone", ""]),
-            ).add_to(m)
-
-            # Zone labels — place on the northernmost point of each ring
-            for feat in GEOJSON_DATA["features"]:
-                z = feat["properties"]["zone"]
-                label = feat["properties"].get("label", f"Zone {z}")
-                coords = feat["geometry"]["coordinates"][0]
-                # Pick the northernmost point (highest lat) for the label
-                top = max(coords, key=lambda c: c[1])
-                folium.Marker(
-                    location=[top[1], top[0]],
-                    icon=folium.DivIcon(
-                        html=(f'<div style="font-size:11px;color:{zone_colours[z]};font-weight:700;'
-                              f'background:rgba(255,255,255,0.75);padding:1px 4px;border-radius:3px;'
-                              f'white-space:nowrap;text-shadow:none">{label}</div>'),
-                        icon_size=(60, 18),
-                        icon_anchor=(30, 18),
-                    ),
-                ).add_to(m)
-
-        # Colour trips by source platform
-        platform_colours = {"uber": "#000000", "bolt": "#34d399", "autocab": "#60a5fa"}
-
-        # Draw trip lines + markers
-        pickup_group = folium.FeatureGroup(name="Pickups", show=True)
-        dropoff_group = folium.FeatureGroup(name="Dropoffs", show=True)
-        route_group = folium.FeatureGroup(name="Routes", show=True)
-
-        for _, row in valid.iterrows():
-            src = (row.get("source") or "").lower()
-            line_colour = platform_colours.get(src, "#6b7280")
-            fare = row.trip_price_in_pound or 0
-            dist = row.distance_in_miles or 0
-            dt = str(row.pickedup_trip_datetime)[:16] if row.pickedup_trip_datetime else ""
-            pz = int(row.pickup_zone) if row.pickup_zone else "?"
-            dz = int(row.dropoff_zone) if row.dropoff_zone else "?"
-
-            popup_html = f"""
-            <div style='font-family:sans-serif;font-size:12px;min-width:180px'>
-              <b>{map_driver_name}</b><br>
-              {dt}<br>
-              <b>£{fare:.2f}</b> &nbsp;·&nbsp; {dist:.1f} mi<br>
-              <span style='color:#6b7280'>Z{pz} → Z{dz} &nbsp;·&nbsp; {src.title()}</span><br>
-              <span style='color:#9ca3af;font-size:11px'>{(row.pickup_address or '')[:50]}</span><br>
-              <span style='color:#9ca3af;font-size:11px'>→ {(row.dropoff_address or '')[:50]}</span>
-            </div>
-            """
-
-            # Route line
-            folium.PolyLine(
-                locations=[[row.plat, row.plon], [row.dlat, row.dlon]],
-                color=line_colour,
-                weight=1.5,
-                opacity=0.45,
-                tooltip=f"£{fare:.2f} · {dist:.1f}mi · {src.title()}",
-            ).add_to(route_group)
-
-            # Pickup dot (green)
-            folium.CircleMarker(
-                location=[row.plat, row.plon],
-                radius=4,
-                color="#16a34a",
-                fill=True,
-                fill_color="#16a34a",
-                fill_opacity=0.8,
-                popup=folium.Popup(popup_html, max_width=240),
-                tooltip=f"Pickup · £{fare:.2f}",
-            ).add_to(pickup_group)
-
-            # Dropoff dot (red)
-            folium.CircleMarker(
-                location=[row.dlat, row.dlon],
-                radius=4,
-                color="#dc2626",
-                fill=True,
-                fill_color="#dc2626",
-                fill_opacity=0.8,
-                tooltip=f"Dropoff · Z{dz}",
-            ).add_to(dropoff_group)
-
-        route_group.add_to(m)
-        pickup_group.add_to(m)
-        dropoff_group.add_to(m)
-        folium.LayerControl(collapsed=False).add_to(m)
-
-        # Legend
-        legend_html = """
-        <div style='position:fixed;bottom:30px;left:30px;z-index:1000;background:white;
-                    padding:10px 14px;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,0.2);
-                    font-family:sans-serif;font-size:12px;line-height:1.8'>
-          <b>Routes by platform</b><br>
-          <span style='color:#000'>■</span> Uber &nbsp;
-          <span style='color:#34d399'>■</span> Bolt &nbsp;
-          <span style='color:#60a5fa'>■</span> Autocab<br>
-          <span style='color:#16a34a'>●</span> Pickup &nbsp;
-          <span style='color:#dc2626'>●</span> Dropoff
-        </div>
-        """
-        m.get_root().html.add_child(folium.Element(legend_html))
-
-        st_folium(m, width="100%", height=680, returned_objects=[])
-
-        # Trip table below map
-        with st.expander("Trip list", expanded=False):
-            display = valid[["pickedup_trip_datetime", "pickup_address", "dropoff_address",
-                              "trip_price_in_pound", "distance_in_miles", "pob_duration_in_min",
-                              "pickup_zone", "dropoff_zone", "source"]].copy()
-            display.columns = ["Datetime", "Pickup", "Dropoff", "Fare £",
-                                "Distance mi", "Ride mins", "Pickup Zone", "Dropoff Zone", "Platform"]
-            display["Pickup Zone"] = display["Pickup Zone"].apply(lambda z: f"Zone {int(z)}" if pd.notna(z) else "?")
-            display["Dropoff Zone"] = display["Dropoff Zone"].apply(lambda z: f"Zone {int(z)}" if pd.notna(z) else "?")
-            st.dataframe(display.sort_values("Datetime", ascending=False), use_container_width=True, hide_index=True)
-
-# ── Time Patterns ─────────────────────────────────────────────────────────────
-elif page == "Time Patterns":
-    st.title("Time of Day Patterns")
-    st.caption("When do top drivers work — and when are they most productive?")
-
-    with st.spinner("Loading trip data..."):
-        hourly_df = db.load_hourly_trips()
-    hourly_filtered = hourly_df[hourly_df["dim_driver_id"].isin(selected_ids)].copy()
-    hourly_filtered["display_name"] = hourly_filtered["dim_driver_id"].map(DRIVER_NAMES).fillna(hourly_filtered["driver_full_name"])
-
-    # Aggregate across all selected drivers
-    by_hour = hourly_filtered.groupby("hour_of_day").agg(
-        trips=("trips", "sum"),
-        avg_fare=("avg_fare", "mean"),
-        avg_distance=("avg_distance", "mean"),
-        avg_ride_mins=("avg_ride_mins", "mean"),
-    ).reset_index()
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Trip Volume by Hour")
-        fig = px.bar(
-            by_hour, x="hour_of_day", y="trips",
-            color="trips", color_continuous_scale="Oranges",
-            labels={"hour_of_day": "Hour of Day", "trips": "Total Trips"},
-        )
-        fig.update_layout(coloraxis_showscale=False, height=350)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        st.subheader("Avg Fare by Hour (£)")
-        fig2 = px.line(
-            by_hour, x="hour_of_day", y="avg_fare",
-            markers=True,
-            labels={"hour_of_day": "Hour of Day", "avg_fare": "Avg Fare (£)"},
-        )
-        fig2.update_traces(line_color="#f59e0b", line_width=2)
-        fig2.update_layout(height=350)
-        st.plotly_chart(fig2, use_container_width=True)
-
-    # Heatmap: hour vs driver
-    st.subheader("Trip Volume Heatmap — Driver × Hour")
-    pivot = hourly_filtered.pivot_table(
-        index="display_name", columns="hour_of_day", values="trips", aggfunc="sum", fill_value=0
-    )
-    fig3 = px.imshow(
-        pivot,
-        color_continuous_scale="YlOrRd",
-        labels={"x": "Hour of Day", "y": "Driver", "color": "Trips"},
-        aspect="auto",
-    )
-    fig3.update_layout(height=420)
-    st.plotly_chart(fig3, use_container_width=True)
-
-    # Day of week heatmap
-    st.subheader("Trip Volume by Day of Week")
-    dow_map = {0: "Sun", 1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat"}
-    hourly_filtered["dow_label"] = hourly_filtered["day_of_week"].map(dow_map)
-    by_dow = hourly_filtered.groupby("dow_label")["trips"].sum().reindex(
-        ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    ).reset_index()
-    by_dow.columns = ["Day", "Trips"]
-    fig4 = px.bar(by_dow, x="Day", y="Trips", color="Trips", color_continuous_scale="Oranges")
-    fig4.update_layout(coloraxis_showscale=False, height=320)
-    st.plotly_chart(fig4, use_container_width=True)
-
-# ── Daily Trends ──────────────────────────────────────────────────────────────
-elif page == "Daily Trends":
-    st.title("Daily Performance Trends")
-    st.caption("How does RPH and utilisation move day to day?")
-
-    with st.spinner("Loading daily data..."):
-        daily_df = db.load_daily_performance()
-    daily_df["display_name"] = daily_df["dim_driver_id"].map(DRIVER_NAMES).fillna(daily_df["driver_name"])
-    daily_filtered = daily_df[daily_df["dim_driver_id"].isin(selected_ids)]
-
-    # Rolling 7-day RPH
-    tab1, tab2, tab3 = st.tabs(["Revenue Per Hour", "Utilisation", "Daily Rides"])
-
-    with tab1:
-        fig = px.line(
-            daily_filtered, x="driver_performance_date", y="rph",
-            color="display_name",
-            labels={"driver_performance_date": "Date", "rph": "£/hr", "display_name": "Driver"},
-            title="Daily Revenue Per Hour (£)",
-        )
-        fig.add_hline(y=21, line_dash="dash", line_color="red", annotation_text="21 £/hr target")
-        fig.update_layout(height=480, legend=dict(orientation="h", yanchor="bottom", y=1.02))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with tab2:
-        fig2 = px.line(
-            daily_filtered, x="driver_performance_date", y="utilisation",
-            color="display_name",
-            labels={"driver_performance_date": "Date", "utilisation": "Utilisation %", "display_name": "Driver"},
-            title="Daily Utilisation %",
-        )
-        fig2.update_layout(height=480, legend=dict(orientation="h", yanchor="bottom", y=1.02))
-        st.plotly_chart(fig2, use_container_width=True)
-
-    with tab3:
-        fig3 = px.line(
-            daily_filtered, x="driver_performance_date", y="rides",
-            color="display_name",
-            labels={"driver_performance_date": "Date", "rides": "Rides", "display_name": "Driver"},
-            title="Daily Rides Completed",
-        )
-        fig3.update_layout(height=480, legend=dict(orientation="h", yanchor="bottom", y=1.02))
-        st.plotly_chart(fig3, use_container_width=True)
-
-    # Per-driver distribution
-    st.subheader("RPH Distribution (Box Plot)")
-    fig4 = px.box(
-        daily_filtered, x="display_name", y="rph",
-        color="display_name",
-        points="outliers",
-        labels={"display_name": "Driver", "rph": "£/hr"},
-    )
-    fig4.add_hline(y=21, line_dash="dash", line_color="red")
-    fig4.update_layout(height=420, showlegend=False)
-    st.plotly_chart(fig4, use_container_width=True)
-
-# ── Trip Economics ────────────────────────────────────────────────────────────
-elif page == "Trip Economics":
-    st.title("Trip Economics")
-    st.caption("Fare, distance, speed, and platform breakdown per driver")
-
-    with st.spinner("Loading trip data..."):
-        econ_df = db.load_trip_economics()
-    econ_df["display_name"] = econ_df["dim_driver_id"].map(DRIVER_NAMES).fillna(econ_df["driver_full_name"])
-    econ_filtered = econ_df[econ_df["dim_driver_id"].isin(selected_ids)]
-
-    # Aggregate (collapse source)
-    by_driver = econ_filtered.groupby(["dim_driver_id", "display_name"]).apply(
-        lambda x: pd.Series({
-            "trips": x["trips"].sum(),
-            "avg_fare": (x["avg_fare"] * x["trips"]).sum() / x["trips"].sum(),
-            "avg_distance": (x["avg_distance"] * x["trips"]).sum() / x["trips"].sum(),
-            "avg_ride_mins": (x["avg_ride_mins"] * x["trips"]).sum() / x["trips"].sum(),
-            "avg_pickup_mins": (x["avg_pickup_mins"] * x["trips"]).sum() / x["trips"].sum(),
-        })
-    ).reset_index()
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Avg Fare per Trip (£)")
-        fig = px.bar(
-            by_driver.sort_values("avg_fare", ascending=True),
-            x="avg_fare", y="display_name", orientation="h",
-            color="avg_fare", color_continuous_scale="YlOrRd",
-            text="avg_fare",
-            labels={"avg_fare": "Avg Fare £", "display_name": ""},
-        )
-        fig.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
-        fig.update_layout(coloraxis_showscale=False, height=370, margin=dict(r=60))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        st.subheader("Avg Pickup Speed (mins to passenger)")
-        fig2 = px.bar(
-            by_driver.sort_values("avg_pickup_mins", ascending=True),
-            x="avg_pickup_mins", y="display_name", orientation="h",
-            color="avg_pickup_mins", color_continuous_scale="RdYlGn_r",
-            text="avg_pickup_mins",
-            labels={"avg_pickup_mins": "Avg Pickup Mins", "display_name": ""},
-        )
-        fig2.update_traces(texttemplate="%{text:.1f} min", textposition="outside")
-        fig2.update_layout(coloraxis_showscale=False, height=370, margin=dict(r=80))
-        st.plotly_chart(fig2, use_container_width=True)
-
-    # Platform breakdown
-    st.subheader("Platform Split (Uber / Bolt / Other)")
-    source_agg = econ_filtered.groupby(["display_name", "source"])["trips"].sum().reset_index()
-    source_agg["source"] = source_agg["source"].str.capitalize().fillna("Unknown")
-    fig3 = px.bar(
-        source_agg, x="display_name", y="trips",
-        color="source", barmode="stack",
-        labels={"display_name": "Driver", "trips": "Trips", "source": "Platform"},
-        color_discrete_map={"Uber": "#000000", "Bolt": "#34d399", "Autocab": "#60a5fa", "Unknown": "#9ca3af"},
-    )
-    fig3.update_layout(height=380, legend=dict(orientation="h"))
-    st.plotly_chart(fig3, use_container_width=True)
-
-    # Scatter: distance vs fare
-    st.subheader("Avg Trip Distance vs Avg Fare")
-    fig4 = px.scatter(
-        by_driver, x="avg_distance", y="avg_fare",
-        size="trips", text="display_name", color="display_name",
-        labels={"avg_distance": "Avg Distance (miles)", "avg_fare": "Avg Fare (£)"},
-        size_max=40,
-    )
-    fig4.update_traces(textposition="top center")
-    fig4.update_layout(height=420, showlegend=False)
-    st.plotly_chart(fig4, use_container_width=True)
-
-# ── Zone Analysis ────────────────────────────────────────────────────────────
-elif page == "Zone Analysis":
-    st.title("London Zone Analysis")
-    st.caption("Zone distribution, fare, distance and ride time — so high zone fares can be weighed against trip length.")
-
-    with st.spinner("Loading trip coordinates and calculating zones (first load ~30s)..."):
-        raw = db.load_zone_trips()
-        raw["display_name"] = raw["dim_driver_id"].map(DRIVER_NAMES).fillna(raw["driver_full_name"])
-        zone_df = enrich_zones(raw)
-        zone_df = calc_true_rph(zone_df)   # adds wait_mins, true_rph
-
-    zf = zone_df[zone_df["dim_driver_id"].isin(selected_ids)].dropna(subset=["pickup_zone", "dropoff_zone"]).copy()
-    zf["pickup_zone"] = zf["pickup_zone"].astype(int)
-    zf["dropoff_zone"] = zf["dropoff_zone"].astype(int)
-    zf["fare_per_mile"] = zf["trip_price_in_pound"] / zf["distance_in_miles"].replace(0, np.nan)
-    zf["fare_per_hour"] = zf["trip_price_in_pound"] / (zf["pob_duration_in_min"].replace(0, np.nan) / 60)
-
-    # ── KPI strip
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Zone 1 Pickups",          f"{(zf['pickup_zone']==1).mean()*100:.0f}%")
-    c2.metric("Cross-Zone Trips",         f"{(zf['pickup_zone']!=zf['dropoff_zone']).mean()*100:.0f}%")
-    c3.metric("True RPH — Z1 pickups",   f"£{zf[zf.pickup_zone==1]['true_rph'].mean():.0f}/hr")
-    c4.metric("True RPH — Z3+ pickups",  f"£{zf[zf.pickup_zone>=3]['true_rph'].mean():.0f}/hr")
-    c5.metric("Avg wait between trips",  f"{zf['gap_mins'].mean():.0f} min")
-
-    st.divider()
-
-    # ── Per-zone stats table including TRUE RPH and avg dropoff zone
-    st.subheader("Per Zone — True RPH, Fare, Distance, Wait & Avg Dropoff Zone")
-    st.caption("True RPH = fare ÷ (wait since last dropoff + ride time). Avg Dropoff Zone shows where passengers end up on average.")
-    zone_stats = zf.groupby("pickup_zone").agg(
-        trips=("trip_price_in_pound", "count"),
-        avg_fare=("trip_price_in_pound", "mean"),
-        avg_distance=("distance_in_miles", "mean"),
-        avg_ride_mins=("pob_duration_in_min", "mean"),
-        avg_wait_mins=("gap_mins", "mean"),
-        true_rph=("true_rph", "mean"),
-        avg_fare_per_mile=("fare_per_mile", "mean"),
-        avg_dropoff_zone=("dropoff_zone", "mean"),
-    ).round(2).reset_index()
-    zone_stats.columns = ["Pickup Zone", "Trips", "Avg Fare £", "Avg Dist mi",
-                          "Ride Mins", "Wait Mins", "True RPH £", "£/Mile", "Avg Dropoff Zone"]
-    zone_stats["Pickup Zone"] = "Zone " + zone_stats["Pickup Zone"].astype(str)
-    zone_stats["Avg Dropoff Zone"] = zone_stats["Avg Dropoff Zone"].apply(lambda x: f"Zone {x:.1f}")
-    st.dataframe(
-        zone_stats.style.background_gradient(subset=["True RPH £", "£/Mile"], cmap="YlOrRd"),
-        use_container_width=True, hide_index=True
-    )
-
-    st.divider()
-
-    # ── Pickup + dropoff zone side by side
-    col_l, col_r = st.columns(2)
-    with col_l:
-        st.subheader("Pickup Zone per Driver")
-        pz = zf.groupby(["display_name", "pickup_zone"]).size().reset_index(name="trips")
-        pz["Zone"] = "Zone " + pz["pickup_zone"].astype(str)
-        fig = px.bar(pz, x="display_name", y="trips", color="Zone", barmode="stack",
-                     color_discrete_sequence=px.colors.sequential.YlOrRd,
-                     labels={"display_name": "", "trips": "Trips"})
-        fig.update_layout(height=380, legend=dict(orientation="h", yanchor="bottom", y=1.02))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_r:
-        st.subheader("Dropoff Zone per Driver")
-        dz = zf.groupby(["display_name", "dropoff_zone"]).size().reset_index(name="trips")
-        dz["Zone"] = "Zone " + dz["dropoff_zone"].astype(str)
-        fig2 = px.bar(dz, x="display_name", y="trips", color="Zone", barmode="stack",
-                      color_discrete_sequence=px.colors.sequential.Blues,
-                      labels={"display_name": "", "trips": "Trips"})
-        fig2.update_layout(height=380, legend=dict(orientation="h", yanchor="bottom", y=1.02))
-        st.plotly_chart(fig2, use_container_width=True)
-
-    # ── Fare vs Duration vs Distance per zone — grouped bars
-    st.subheader("Fare, Distance and Ride Time by Pickup Zone — per driver")
-    metric_choice = st.radio("Metric", ["True RPH £", "Avg Fare £", "Avg Distance mi", "Avg Ride Mins", "Wait Mins", "£/Mile", "£/Hour"], horizontal=True)
-    metric_map = {"True RPH £": "true_rph", "Avg Fare £": "trip_price_in_pound",
-                  "Avg Distance mi": "distance_in_miles", "Avg Ride Mins": "pob_duration_in_min",
-                  "Wait Mins": "gap_mins", "£/Mile": "fare_per_mile", "£/Hour": "fare_per_hour"}
-    metric_col = metric_map[metric_choice]
-
-    per_driver_zone = zf.groupby(["display_name", "pickup_zone"])[metric_col].mean().reset_index()
-    per_driver_zone.columns = ["Driver", "Pickup Zone", metric_choice]
-    per_driver_zone["Pickup Zone"] = "Zone " + per_driver_zone["Pickup Zone"].astype(str)
-
-    fig3 = px.bar(per_driver_zone, x="Pickup Zone", y=metric_choice, color="Driver",
-                  barmode="group", labels={"Pickup Zone": "Pickup Zone"})
-    fig3.update_layout(height=420, legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    st.plotly_chart(fig3, use_container_width=True)
-
-    # ── Trip type breakdown
-    st.subheader("Trip Type Breakdown")
-    tta = zf.groupby(["display_name", "trip_type"]).size().reset_index(name="trips")
-    totals = tta.groupby("display_name")["trips"].transform("sum")
-    tta["pct"] = (tta["trips"] / totals * 100).round(1)
-    fig4 = px.bar(tta, x="pct", y="display_name", color="trip_type", orientation="h", barmode="stack",
-                  color_discrete_map={"Zone 1 local":"#ef4444","Zone 1 out":"#f97316","Zone 1 in":"#fb923c",
-                                      "Outbound":"#60a5fa","Inbound":"#818cf8","Zone 2 local":"#a78bfa",
-                                      "Zone 3 local":"#c084fc","Zone 4 local":"#e879f9","Unknown":"#6b7280"},
-                  labels={"pct":"% of Trips","display_name":"","trip_type":"Type"})
-    fig4.update_layout(height=380, legend=dict(orientation="h"))
-    st.plotly_chart(fig4, use_container_width=True)
-
-    # ── Strategy scatter: Zone 1 %, avg fare, coloured by £/mile
-    st.subheader("Zone Strategy: Volume vs Efficiency")
-    profile = zf.groupby("display_name").agg(
-        zone1_pct=("pickup_zone", lambda x: (x==1).mean()*100),
-        avg_fare=("trip_price_in_pound", "mean"),
-        avg_fpm=("fare_per_mile", "mean"),
-        trips=("trip_price_in_pound", "count"),
-    ).reset_index().round(2)
-    fig5 = px.scatter(profile, x="zone1_pct", y="avg_fare", size="trips",
-                      text="display_name", color="avg_fpm", color_continuous_scale="YlOrRd",
-                      labels={"zone1_pct":"% Pickups in Zone 1","avg_fare":"Avg Fare £","avg_fpm":"£/Mile"},
-                      size_max=50)
-    fig5.update_traces(textposition="top center")
-    fig5.update_layout(height=450)
-    st.plotly_chart(fig5, use_container_width=True)
-    st.caption("Top-right + warm colour = Zone 1 focused AND high £/mile efficiency. That's the sweet spot.")
-
-# ── Day Patterns ─────────────────────────────────────────────────────────────
-elif page == "Day Patterns":
-    st.title("Day Patterns")
-    st.caption("How does a driver structure their day? Big rides only, small runs only, or a deliberate mix?")
-
-    with st.spinner("Loading trip-level data..."):
-        dp = db.load_day_patterns()
-    dp["display_name"] = dp["dim_driver_id"].map(DRIVER_NAMES).fillna(dp["driver_full_name"])
-    dp = dp[dp["dim_driver_id"].isin(selected_ids)].copy()
-    dp["trip_date"] = pd.to_datetime(dp["trip_date"])
-    dp["dow_label"] = dp["dow"].map({0:"Sun",1:"Mon",2:"Tue",3:"Wed",4:"Thu",5:"Fri",6:"Sat"})
-
-    # Classify trips by size
-    short_cut  = dp["distance"].quantile(0.33)
-    long_cut   = dp["distance"].quantile(0.67)
-    dp["trip_size"] = pd.cut(dp["distance"],
-                             bins=[0, short_cut, long_cut, 999],
-                             labels=["Short (<{:.1f}mi)".format(short_cut),
-                                     "Mid ({:.1f}–{:.1f}mi)".format(short_cut, long_cut),
-                                     "Long (>{:.1f}mi)".format(long_cut)])
-
-    # ── Trip size mix per driver
-    st.subheader("Trip Size Mix per Driver")
-    st.caption("Short / mid / long based on distance terciles across all 10 drivers.")
-    size_agg = dp.groupby(["display_name", "trip_size"]).size().reset_index(name="trips")
-    totals = size_agg.groupby("display_name")["trips"].transform("sum")
-    size_agg["pct"] = (size_agg["trips"] / totals * 100).round(1)
-    fig = px.bar(size_agg, x="pct", y="display_name", color="trip_size", orientation="h", barmode="stack",
-                 color_discrete_map={"Short (<{:.1f}mi)".format(short_cut): "#34d399",
-                                     "Mid ({:.1f}–{:.1f}mi)".format(short_cut, long_cut): "#f59e0b",
-                                     "Long (>{:.1f}mi)".format(long_cut): "#ef4444"},
-                 labels={"pct":"% of Trips","display_name":"","trip_size":"Trip Size"})
-    fig.update_layout(height=380, legend=dict(orientation="h"))
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-
-    # ── Fare distribution by trip size per driver
-    st.subheader("Fare Distribution by Trip Size")
-    fig2 = px.box(dp, x="trip_size", y="fare", color="display_name", points=False,
-                  labels={"trip_size":"Trip Size","fare":"Fare £","display_name":"Driver"})
-    fig2.update_layout(height=420, legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    st.plotly_chart(fig2, use_container_width=True)
-
-    st.divider()
-
-    # ── Intra-day sequencing: per driver, show how trip size evolves through the day
-    st.subheader("How Trip Size Changes Through the Day")
-    st.caption("Each bar = avg fare for trips starting in that hour. Helps spot 'morning long-haul then afternoon churn' patterns.")
-    hour_size = dp.groupby(["display_name", "hour"]).agg(
-        avg_fare=("fare", "mean"),
-        avg_dist=("distance", "mean"),
-        trips=("fare", "count"),
-    ).reset_index()
-
-    sel_driver = st.selectbox("Driver", ["All"] + sorted(dp["display_name"].unique().tolist()), key="dp_driver")
-    if sel_driver != "All":
-        hour_size = hour_size[hour_size["display_name"] == sel_driver]
-
-    fig3 = px.bar(hour_size, x="hour", y="avg_fare", color="display_name" if sel_driver=="All" else "avg_dist",
-                  barmode="group" if sel_driver=="All" else "relative",
-                  color_continuous_scale="YlOrRd",
-                  labels={"hour":"Hour of Day","avg_fare":"Avg Fare £","display_name":"Driver","avg_dist":"Avg Dist mi"})
-    fig3.update_layout(height=400, showlegend=(sel_driver=="All"),
-                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    st.plotly_chart(fig3, use_container_width=True)
-
-    st.divider()
-
-    # ── Session analysis: for a given driver+day, classify the session strategy
-    st.subheader("Session Strategy — per working day")
-    st.caption("Classifies each day: 'Big then small' = long-haul opener followed by short runs; 'Consistent' = similar trip sizes all day.")
-
-    def classify_session(group):
-        if len(group) < 4:
-            return "Too few trips"
-        group = group.sort_values("pickedup_trip_datetime")
-        first_half = group.iloc[:len(group)//2]["distance"].mean()
-        second_half = group.iloc[len(group)//2:]["distance"].mean()
-        overall_std = group["distance"].std()
-        if overall_std < 2:
-            return "Consistent (uniform trip size)"
-        elif first_half > second_half * 1.4:
-            return "Big-first (long haul → short runs)"
-        elif second_half > first_half * 1.4:
-            return "Small-first (short runs → long haul)"
-        else:
-            return "Mixed (varied throughout)"
-
-    session_df = dp.groupby(["display_name", "trip_date"]).apply(classify_session).reset_index()
-    session_df.columns = ["Driver", "Date", "Strategy"]
-
-    strat_counts = session_df.groupby(["Driver", "Strategy"]).size().reset_index(name="Days")
-    totals2 = strat_counts.groupby("Driver")["Days"].transform("sum")
-    strat_counts["pct"] = (strat_counts["Days"] / totals2 * 100).round(1)
-
-    fig4 = px.bar(strat_counts, x="pct", y="Driver", color="Strategy", orientation="h", barmode="stack",
-                  color_discrete_map={
-                      "Consistent (uniform trip size)": "#34d399",
-                      "Big-first (long haul → short runs)": "#f97316",
-                      "Small-first (short runs → long haul)": "#818cf8",
-                      "Mixed (varied throughout)": "#60a5fa",
-                      "Too few trips": "#d1d5db",
-                  },
-                  labels={"pct":"% of Days","Driver":"","Strategy":"Day Strategy"})
-    fig4.update_layout(height=400, legend=dict(orientation="h"))
-    st.plotly_chart(fig4, use_container_width=True)
-
-    # ── £/hour by hour of day — real productivity curve
-    st.subheader("£ Earned Per Trip by Hour — Productivity Curve")
-    st.caption("Not just volume — how much is each hour of the day actually worth per trip?")
-    hourly_rev = dp.groupby(["display_name", "hour"])["fare"].mean().reset_index()
-    fig5 = px.line(hourly_rev, x="hour", y="fare", color="display_name",
-                   markers=True,
-                   labels={"hour":"Hour of Day","fare":"Avg Fare £","display_name":"Driver"})
-    fig5.update_layout(height=420, legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    st.plotly_chart(fig5, use_container_width=True)
-
-# ── Shift Behaviour ───────────────────────────────────────────────────────────
-elif page == "Shift Behaviour":
-    st.title("Shift Behaviour")
-    st.caption("When do top drivers start and end their shifts? How long do they run?")
-
-    with st.spinner("Loading shift data..."):
-        shift_df = db.load_shift_patterns()
-    shift_df["display_name"] = shift_df["dim_driver_id"].map(DRIVER_NAMES).fillna(shift_df["driver_full_name"])
-    shift_filtered = shift_df[shift_df["dim_driver_id"].isin(selected_ids)]
-
-    by_driver = shift_filtered.groupby("display_name").agg(
-        avg_start=("shift_start_hr", "mean"),
-        avg_end=("shift_end_hr", "mean"),
-        avg_span=("shift_span_hrs", "mean"),
-        avg_trips=("trips_in_shift", "mean"),
-        avg_revenue=("shift_revenue", "mean"),
-        shifts=("shift_date", "count"),
-    ).reset_index().round(1)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Typical Shift Start Hour")
-        fig = px.bar(
-            by_driver.sort_values("avg_start"),
-            x="avg_start", y="display_name", orientation="h",
-            color="avg_start", color_continuous_scale="Blues",
-            text="avg_start",
-            labels={"avg_start": "Avg Start Hour", "display_name": ""},
-        )
-        fig.update_traces(texttemplate="%{text:.1f}:00", textposition="outside")
-        fig.update_layout(coloraxis_showscale=False, height=370, margin=dict(r=70))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        st.subheader("Avg Shift Span (hours active)")
-        fig2 = px.bar(
-            by_driver.sort_values("avg_span", ascending=False),
-            x="avg_span", y="display_name", orientation="h",
-            color="avg_span", color_continuous_scale="Oranges",
-            text="avg_span",
-            labels={"avg_span": "Avg Span (hrs)", "display_name": ""},
-        )
-        fig2.update_traces(texttemplate="%{text:.1f} hrs", textposition="outside")
-        fig2.update_layout(coloraxis_showscale=False, height=370, margin=dict(r=80))
-        st.plotly_chart(fig2, use_container_width=True)
-
-    st.subheader("Start Hour Distribution (when do they actually clock in?)")
-    fig3 = px.histogram(
-        shift_filtered, x="shift_start_hr", color="display_name",
-        nbins=24, barmode="overlay", opacity=0.7,
-        labels={"shift_start_hr": "Hour Started First Trip", "display_name": "Driver"},
-    )
-    fig3.update_layout(height=400, legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    st.plotly_chart(fig3, use_container_width=True)
-
-    st.subheader("Summary Table")
-    st.dataframe(
-        by_driver.rename(columns={
-            "display_name": "Driver", "avg_start": "Avg Start Hr",
-            "avg_end": "Avg End Hr", "avg_span": "Avg Span Hrs",
-            "avg_trips": "Avg Trips/Shift", "avg_revenue": "Avg Revenue £/Shift",
-            "shifts": "Shifts Recorded"
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )

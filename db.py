@@ -245,8 +245,24 @@ def load_comparison_trips(driver_ids):
     """, (list(driver_ids),))
 
 @st.cache_data(ttl=3600)
-def load_comparison_flow(driver_ids):
+def load_comparison_flow(driver_ids, days_back=None):
     """Accepted + declined trips for zone flow comparison."""
+    if days_back is not None:
+        from_date = (pd.Timestamp.now() - pd.Timedelta(days=days_back)).strftime("%Y-%m-%d")
+        return query("""
+            SELECT dim_driver_id,
+                   status,
+                   pickup_lat_long, dropoff_latlong,
+                   trip_price_in_pound, distance_in_miles,
+                   trips_hr
+            FROM rep_fact_trips
+            WHERE dim_driver_id = ANY(%s)
+              AND status IN ('completed','Finished','Driver did not respond','Driver rejected')
+              AND pickup_lat_long  IS NOT NULL AND pickup_lat_long  != ''
+              AND dropoff_latlong  IS NOT NULL AND dropoff_latlong  != ''
+              AND distance_in_miles <= 60
+              AND pickedup_trip_datetime >= %s
+        """, (list(driver_ids), from_date))
     return query("""
         SELECT dim_driver_id,
                status,
@@ -260,6 +276,32 @@ def load_comparison_flow(driver_ids):
           AND dropoff_latlong  IS NOT NULL AND dropoff_latlong  != ''
           AND distance_in_miles <= 60
     """, (list(driver_ids),))
+
+@st.cache_data(ttl=3600)
+def load_fleet_driver_ids(days_back=30):
+    """Return all distinct driver IDs active in the last N days."""
+    from_date = (pd.Timestamp.now() - pd.Timedelta(days=days_back)).strftime("%Y-%m-%d")
+    result = query("""
+        SELECT DISTINCT dim_driver_id
+        FROM rep_fact_trips
+        WHERE status IN ('completed','Finished')
+          AND pickedup_trip_datetime >= %s
+    """, (from_date,))
+    return result["dim_driver_id"].tolist() if not result.empty else []
+
+@st.cache_data(ttl=3600)
+def load_fleet_baseline_excluding(exclude_ids):
+    """Fleet-wide avg RPH, utilisation, acceptance excluding specified driver IDs."""
+    return query("""
+        SELECT
+            ROUND((SUM(revenue) / NULLIF(SUM(online_time_in_hrs), 0))::numeric, 2)   AS fleet_rph,
+            ROUND(AVG(utilisation_percent)::numeric, 1)                               AS fleet_util,
+            ROUND(AVG(NULLIF(total_acceptance_rate_percent, 0))::numeric, 1)          AS fleet_accept,
+            COUNT(DISTINCT dim_driver_id)                                             AS driver_count
+        FROM rep_fact_driver_performance
+        WHERE online_time_in_hrs > 0
+          AND dim_driver_id != ALL(%s)
+    """, (list(exclude_ids),))
 
 @st.cache_data(ttl=3600)
 def load_comparison_performance(driver_ids):
@@ -329,6 +371,21 @@ def load_driver_declined_day(driver_id, date_str):
           AND status IN ('Driver did not respond', 'Driver rejected')
           AND DATE(trip_booking_datetime) = %s::date
           AND pickup_lat_long IS NOT NULL AND pickup_lat_long != ''
+        ORDER BY trip_booking_datetime
+    """, (driver_id, date_str))
+
+def load_driver_accepted_day(driver_id, date_str):
+    """Completed trips for one driver on one date — used for today's live view."""
+    return query("""
+        SELECT trip_price_in_pound,
+               pickedup_trip_datetime,
+               distance_in_miles,
+               source
+        FROM rep_fact_trips
+        WHERE dim_driver_id = %s
+          AND status IN ('completed', 'Finished')
+          AND DATE(pickedup_trip_datetime) = %s::date
+        ORDER BY pickedup_trip_datetime
     """, (driver_id, date_str))
 
 @st.cache_data(ttl=3600)
