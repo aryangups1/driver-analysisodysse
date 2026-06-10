@@ -135,8 +135,9 @@ trips_bad = db.load_comparison_trips(BAD_DRIVER_IDS)
 
 coords    = db.load_all_driver_coords(sample_per_driver=80, days_back=60)
 
-gaps_top  = db.load_gap_accepted(TOP_DRIVER_IDS, days_back=60)
-gaps_bad  = db.load_gap_accepted(BAD_DRIVER_IDS, days_back=60)
+gaps_top     = db.load_gap_accepted(TOP_DRIVER_IDS, days_back=60)
+gaps_bad     = db.load_gap_accepted(BAD_DRIVER_IDS, days_back=60)
+flow_yousuf  = db.load_comparison_flow([219])   # outlier spotlight — not in TOP_DRIVER_IDS
 
 print("Data loaded. Enriching zones…")
 
@@ -167,6 +168,22 @@ acc_bad = _enrich(
 )
 acc_top["fare"] = pd.to_numeric(acc_top["trip_price_in_pound"], errors="coerce")
 acc_bad["fare"] = pd.to_numeric(acc_bad["trip_price_in_pound"], errors="coerce")
+
+acc_yousuf = _enrich(
+    flow_yousuf[flow_yousuf["status"].isin(["completed","Finished"])].copy(),
+    lon_col="dropoff_latlong"
+)
+acc_yousuf["fare"] = pd.to_numeric(acc_yousuf["trip_price_in_pound"], errors="coerce")
+
+# Inner / outer sub-region classification (applied to all accepted trips)
+def _subregion(plon):
+    if plon < -0.25:   return "Outer West"
+    if plon < -0.12:   return "Inner West"
+    if plon <  0.0:    return "Inner East"
+    return "Outer East"
+
+acc_top["subregion"] = acc_top["plon"].apply(_subregion)
+acc_bad["subregion"] = acc_bad["plon"].apply(_subregion)
 
 # Fleet map coords
 cat_map = {}  # driver_id → category
@@ -348,7 +365,8 @@ fig_rph.add_vline(x=top_rph, line_dash="dash", line_color="#22c55e",
                   annotation_text=f"Top avg £{top_rph:.2f}")
 fig_rph.add_vline(x=bad_rph, line_dash="dash", line_color="#ef4444",
                   annotation_text=f"Bad avg £{bad_rph:.2f}", annotation_position="bottom right")
-fig_rph.update_layout(showlegend=True, legend=dict(orientation="h",y=1.05))
+fig_rph.update_layout(showlegend=True, legend=dict(orientation="h",y=1.05),
+                      margin=dict(l=200, r=80, t=50, b=40))
 _add_image(s, _fig_to_img(fig_rph, w=900, h=430), Inches(0.5), Inches(2.6), Inches(8.1), Inches(4.6))
 
 # Fare comparison bar
@@ -363,7 +381,7 @@ fig_fare2 = px.bar(
     height=430,
 )
 fig_fare2.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
-fig_fare2.update_layout(showlegend=False)
+fig_fare2.update_layout(showlegend=False, margin=dict(l=200, r=80, t=50, b=40))
 _add_image(s, _fig_to_img(fig_fare2, w=520, h=430), Inches(8.8), Inches(2.6), Inches(4.3), Inches(4.6))
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -417,18 +435,79 @@ _add_text(s, "Yellow line = Charing Cross boundary (−0.12°)  ·  Green = top 
           size=10, color=C_MUTED, italic=True, align=PP_ALIGN.CENTER)
 
 # ════════════════════════════════════════════════════════════════════════════
-# SLIDE 5: SAME STREETS, COMPLETELY DIFFERENT OUTCOMES
+# SLIDE 5: INNER / OUTER ZONE BREAKDOWN
+# ════════════════════════════════════════════════════════════════════════════
+s = _blank_slide(prs)
+_slide_header(s, "Breaking London Down: Where Wait Times Stack Up",
+              "Four sub-regions tell four different stories. "
+              "Inner East is survivable. Outer East is where shifts go to die.")
+
+_sub_order = ["Outer West", "Inner West", "Inner East", "Outer East"]
+_sub_colors = {"Outer West": "#3b82f6", "Inner West": "#22c55e",
+               "Inner East": "#f59e0b", "Outer East": "#ef4444"}
+
+def _subregion_stats(df, label):
+    rows = []
+    for sub in _sub_order:
+        s_df = df[df["subregion"] == sub]
+        rows.append({
+            "Sub-region": sub, "Group": label,
+            "Avg fare £":   round(s_df["fare"].mean(), 2) if len(s_df) else 0,
+            "Trip share %": round(len(s_df) / max(len(df), 1) * 100, 1),
+            "Sub-£10 %":    round((s_df["fare"] < 10).mean() * 100, 1) if len(s_df) else 0,
+        })
+    return rows
+
+_sub_rows = _subregion_stats(acc_top, "Top drivers") + _subregion_stats(acc_bad, "Comparison")
+_sub_df = pd.DataFrame(_sub_rows)
+
+fig_sub_fare = px.bar(
+    _sub_df, x="Sub-region", y="Avg fare £", color="Group", barmode="group",
+    color_discrete_map={"Top drivers": "#22c55e", "Comparison": "#ef4444"},
+    category_orders={"Sub-region": _sub_order},
+    text_auto=".2f", title="Avg accepted fare by sub-region",
+    height=310,
+)
+fig_sub_fare.update_traces(texttemplate="£%{text}", textposition="outside")
+fig_sub_fare.update_layout(legend=dict(orientation="h", y=1.08),
+                           margin=dict(l=50, r=30, t=55, b=40))
+_add_image(s, _fig_to_img(fig_sub_fare, w=760, h=310), Inches(0.4), Inches(1.3), Inches(6.5), Inches(3.6))
+
+fig_sub_noise = px.bar(
+    _sub_df, x="Sub-region", y="Sub-£10 %", color="Group", barmode="group",
+    color_discrete_map={"Top drivers": "#22c55e", "Comparison": "#ef4444"},
+    category_orders={"Sub-region": _sub_order},
+    text_auto=".1f", title="Sub-£10 trip share (noise) by sub-region",
+    height=310,
+)
+fig_sub_noise.update_traces(texttemplate="%{text}%", textposition="outside")
+fig_sub_noise.update_layout(legend=dict(orientation="h", y=1.08),
+                             margin=dict(l=50, r=30, t=55, b=40))
+_add_image(s, _fig_to_img(fig_sub_noise, w=760, h=310), Inches(7.0), Inches(1.3), Inches(6.0), Inches(3.6))
+
+# Sub-region boundary callout
+_sub_ref = {sub: _sub_df[(_sub_df["Sub-region"]==sub) & (_sub_df["Group"]=="Top drivers")]["Avg fare £"].values for sub in _sub_order}
+_callout(s,
+    "SUB-REGION BOUNDARIES\n"
+    "Outer West (lon < −0.25): Heathrow corridor, Richmond, Chiswick — long-haul heavy, "
+    f"avg fare £{_sub_ref['Outer West'][0]:.2f} for top drivers.\n"
+    "Inner West (−0.25 to −0.12): Kensington, Chelsea, Mayfair — premium short/medium trips.\n"
+    "Inner East (−0.12 to 0.0): City of London, Shoreditch — high noise, high ceiling. Yousuf's territory.\n"
+    "Outer East (lon > 0.0): East Ham, Walthamstow, Enfield — where pings dry up and fares crater. "
+    "Bad drivers spend disproportionate time here and accept the scraps.",
+    Inches(0.4), Inches(5.1), Inches(12.5), Inches(1.8), border_color=C_AMBER)
+
+# ════════════════════════════════════════════════════════════════════════════
+# SLIDE 6: SAME STREETS, COMPLETELY DIFFERENT OUTCOMES
 # ════════════════════════════════════════════════════════════════════════════
 s = _blank_slide(prs)
 _slide_header(s, "Same Streets. Completely Different Outcomes.",
               "The east isn't the problem. What drivers accept in the east is the problem.")
 
 # Yousuf vs Bartley fare scatter
-_id_yousuf, _id_bartley = 219, 82
-_yousuf_trips = acc_top[(acc_top["dim_driver_id"]==_id_yousuf) | (acc_top["dim_driver_id"]==_id_bartley)].copy()
-_bartley_trips = acc_bad[acc_bad["dim_driver_id"]==_id_bartley].copy()
+_bartley_trips = acc_bad[acc_bad["dim_driver_id"]==82].copy()
 _compare = pd.concat([
-    acc_top[acc_top["dim_driver_id"]==_id_yousuf].assign(driver="Mohamed Yousuf (Cat A — selective)"),
+    acc_yousuf.assign(driver="Mohamed Yousuf (Cat A — selective)"),
     _bartley_trips.assign(driver="Aaron Bartley (Cat D — noise acceptor)"),
 ], ignore_index=True)
 _compare["fare"] = pd.to_numeric(_compare["trip_price_in_pound"], errors="coerce")
@@ -696,42 +775,69 @@ _callout(s,
 # SLIDE 11: ACCEPTANCE RATE — THE FLEET IS OVERSHOOTING IN BOTH DIRECTIONS
 # ════════════════════════════════════════════════════════════════════════════
 s = _blank_slide(prs)
-_slide_header(s, "Acceptance Rate: The Fleet Has Overcorrected",
-              "Top drivers naturally land at ~49%. The fleet went from 57% (too high) to 43% (too low). "
-              "Bolt's 50% target is exactly where our best drivers already are.")
+_slide_header(s, "Acceptance Rate: Lower Acceptance, Higher Earnings — The Data Proves It",
+              "April: 53% acceptance, £20.74/hr.  May: 43% acceptance, £22.44/hr. "
+              "The fleet over-corrected but the direction was right. Target is 50% — where top drivers naturally land.")
 
+# Left: acceptance rate history bar
 acc_hist = pd.DataFrame({
-    "Period":          ["Historical fleet", "Top 10 drivers", "April 2026", "May 2026", "Bolt target"],
-    "Acceptance rate": [57.2,              top_acc,           53.0,         43.0,       50.0],
-    "Color":           ["#64748b",          "#22c55e",        "#3b82f6",   "#ef4444",  "#f59e0b"],
+    "Period":          ["Historical\nfleet", f"Top 10\ndrivers\n({top_acc:.0f}%)", "April\n2026", "May\n2026", "Bolt\ntarget"],
+    "Acceptance rate": [57.2,               top_acc,                               53.0,          43.0,        50.0],
+    "Color":           ["#64748b",           "#22c55e",                             "#3b82f6",     "#ef4444",   "#f59e0b"],
 })
 fig_acc_hist = go.Figure()
 for _, row in acc_hist.iterrows():
     fig_acc_hist.add_bar(x=[row["Period"]], y=[row["Acceptance rate"]],
                          name=row["Period"], marker_color=row["Color"],
-                         text=f"{row['Acceptance rate']:.0f}%",
-                         textposition="outside")
+                         text=f"{row['Acceptance rate']:.0f}%", textposition="outside")
 fig_acc_hist.add_hline(y=50, line_dash="dash", line_color="#f59e0b",
                        annotation_text="Bolt target 50%", annotation_position="top right")
 fig_acc_hist.update_layout(showlegend=False, yaxis_title="Acceptance rate (%)",
-                           height=350, title="Acceptance rate — fleet history vs target",
-                           yaxis=dict(range=[0,70]))
-_add_image(s, _fig_to_img(fig_acc_hist, w=780, h=350), Inches(0.5), Inches(1.4), Inches(7.5), Inches(4.5))
+                           height=330, title="Acceptance rate — fleet history vs target",
+                           yaxis=dict(range=[0,72]), margin=dict(l=50,r=30,t=50,b=40))
+_add_image(s, _fig_to_img(fig_acc_hist, w=680, h=330), Inches(0.4), Inches(1.3), Inches(6.0), Inches(3.8))
+
+# Right: April vs May dual-axis — acceptance rate vs RPH (the KEY new repo finding)
+fig_apr_may = go.Figure()
+months   = ["April 2026", "May 2026"]
+acc_vals = [53.0, 43.0]
+rph_vals = [20.74, 22.44]
+
+fig_apr_may.add_bar(x=months, y=acc_vals, name="Acceptance rate (%)",
+                    marker_color=["#3b82f6","#ef4444"],
+                    text=[f"{v:.0f}%" for v in acc_vals], textposition="outside",
+                    yaxis="y1")
+fig_apr_may.add_scatter(x=months, y=rph_vals, name="Avg RPH (£)",
+                        mode="lines+markers+text",
+                        line=dict(color="#f59e0b", width=3),
+                        marker=dict(size=12, color="#f59e0b"),
+                        text=[f"£{v:.2f}" for v in rph_vals],
+                        textposition="top center",
+                        textfont=dict(color="#f59e0b", size=14),
+                        yaxis="y2")
+fig_apr_may.update_layout(
+    title="April vs May: Acceptance ↓, RPH ↑",
+    yaxis=dict(title="Acceptance rate (%)", range=[0,70], color="#94a3b8"),
+    yaxis2=dict(title="RPH (£)", range=[18,26], overlaying="y", side="right",
+                color="#f59e0b", showgrid=False),
+    legend=dict(orientation="h", y=1.1),
+    height=330, margin=dict(l=50,r=60,t=55,b=40),
+    barmode="group",
+)
+_add_image(s, _fig_to_img(fig_apr_may, w=680, h=330), Inches(6.8), Inches(1.3), Inches(6.2), Inches(3.8))
+
+# Metric strip
+_metric_card(s, "April acceptance",  "53%",     Inches(0.4),  Inches(5.35), val_color=C_BLUE,  w=Inches(2.5))
+_metric_card(s, "April RPH",         "£20.74",  Inches(3.1),  Inches(5.35), val_color=C_BLUE,  w=Inches(2.5))
+_metric_card(s, "May acceptance",    "43%",     Inches(5.8),  Inches(5.35), val_color=C_RED,   w=Inches(2.5))
+_metric_card(s, "May RPH",           "£22.44",  Inches(8.5),  Inches(5.35), val_color=C_GREEN, w=Inches(2.5),
+             delta="+£1.70/hr with 10pp fewer accepts", delta_color=C_GREEN)
 
 _callout(s,
-    "WHAT THIS TELLS US\n"
-    "The fleet's acceptance rate dropped from 57% → 43% as drivers learned to filter bad trips. "
-    "That's directionally right — but it overshot. The top 10 drivers demonstrate that ~49–50% is "
-    "the natural equilibrium when you accept the right trips.\n\n"
-    "The path back to 50% is not 'accept more randomly.' It is:\n"
-    "  A. Stay in Z1/Z2 positioning (better ping quality naturally raises acceptance)\n"
-    "  B. Relax fare floor during peak hours only\n"
-    "  C. Filter by distance, not fare\n"
-    "  D. Avoid daytime Z3 drift\n"
-    "  E. Shift dwell time westward\n\n"
-    "Airport queue dead time (Heathrow queuing = missed pings) is suppressing the "
-    "current 43% by an estimated 1–2pp — this needs to be flagged to Bolt separately.",
-    Inches(8.3), Inches(1.4), Inches(4.8), Inches(5.5), border_color=C_AMBER)
+    "AIRPORT DRAG — hidden suppressor of the current 43%: Drivers queuing at Heathrow cannot accept pings. "
+    "Every missed ping during queue time counts as a decline. This alone accounts for an estimated 1–2pp "
+    "of the 43% figure and cannot be fixed through driver behaviour — Bolt must exclude queue windows from the KPI.",
+    Inches(0.4), Inches(6.65), Inches(12.5), Inches(0.7), border_color=C_RED)
 
 # ════════════════════════════════════════════════════════════════════════════
 # SLIDE 12: THE MODEL — WHAT PARAMETERS IT NEEDS
