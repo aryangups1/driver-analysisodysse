@@ -138,6 +138,7 @@ coords    = db.load_all_driver_coords(sample_per_driver=80, days_back=60)
 gaps_top     = db.load_gap_accepted(TOP_DRIVER_IDS, days_back=60)
 gaps_bad     = db.load_gap_accepted(BAD_DRIVER_IDS, days_back=60)
 flow_yousuf  = db.load_comparison_flow([219])   # outlier spotlight — not in TOP_DRIVER_IDS
+zone_trips_raw = db.load_zone_trips()            # full fleet trips for Z3 bubble map + drift
 
 print("Data loaded. Enriching zones…")
 
@@ -184,6 +185,25 @@ def _subregion(plon):
 
 acc_top["subregion"] = acc_top["plon"].apply(_subregion)
 acc_bad["subregion"] = acc_bad["plon"].apply(_subregion)
+
+# ── Zone trip data for Z3 bubble map + drift chart ────────────────────────
+_zt = zone_trips_raw.copy()
+_zt["pickedup_trip_datetime"] = pd.to_datetime(_zt["pickedup_trip_datetime"], errors="coerce")
+_zt["dropoff_trip_datetime"]  = pd.to_datetime(_zt["dropoff_trip_datetime"],  errors="coerce")
+_pu2 = _zt["pickup_lat_long"].apply(lambda x: parse_dms(str(x or "")))
+_do2 = _zt["dropoff_latlong"].apply(lambda x: parse_dms(str(x or "")))
+_zt["plat"] = [c[0] for c in _pu2]; _zt["plon"] = [c[1] for c in _pu2]
+_zt["dlat"] = [c[0] for c in _do2]; _zt["dlon"] = [c[1] for c in _do2]
+_zt = _zt.dropna(subset=["plat","plon","dlat","dlon"])
+_zt = _zt[(_zt["dlat"].between(51.2,51.8)) & (_zt["plat"].between(51.2,51.8))].reset_index(drop=True)
+_zt["dropoff_zone"]  = [assign_zone(a, b) for a, b in zip(_zt["dlat"], _zt["dlon"])]
+_zt["dropoff_side"]  = _zt["dlon"].apply(lambda x: "West" if x < _WEST_LON else "East")
+_zt["fare"]          = pd.to_numeric(_zt["trip_price_in_pound"], errors="coerce").fillna(0)
+_zt = _zt.sort_values(["dim_driver_id","pickedup_trip_datetime"]).reset_index(drop=True)
+_zt["next_pickup"]   = _zt.groupby("dim_driver_id")["pickedup_trip_datetime"].shift(-1)
+_zt["gap_after"]     = ((_zt["next_pickup"] - _zt["dropoff_trip_datetime"])
+                         .dt.total_seconds() / 60).clip(0, 90)
+_color_z = ["#22c55e","#4ade80","#f59e0b","#fb923c","#ef4444","#dc2626"]
 
 # Fleet map coords
 cat_map = {}  # driver_id → category
@@ -632,6 +652,83 @@ _callout(s,
     f"Bad drivers run {chain_bad:.0f}% of trips as Z3→Z3 chains. "
     f"Top drivers: {chain_top:.0f}%. Every Z3→Z3 chain is another 32 minutes of below-average RPH locked in.",
     Inches(8.1), Inches(2.75), Inches(5.0), Inches(4.0), border_color=C_RED)
+
+# ════════════════════════════════════════════════════════════════════════════
+# SLIDE 9 (NEW): Z3 STRANDING MAP + RECOVERY / DRIFT
+# ════════════════════════════════════════════════════════════════════════════
+s = _blank_slide(prs)
+_slide_header(s, "Where Exactly Are Drivers Getting Stuck — and Where Do They Go Next?",
+              "Each bubble = a Zone 3 dropoff. Size and colour show the gap before the next trip. "
+              "Red = stuck. Right panel: what zone comes next.")
+
+# Z3 bubble map
+_z3_map = _zt[(_zt["dropoff_zone"] == 3) & _zt["gap_after"].notna()].copy()
+_z3_map["gap_label"] = _z3_map["gap_after"].apply(lambda x: f"{x:.0f} min gap")
+
+fig_z3bubble = px.scatter_mapbox(
+    _z3_map, lat="dlat", lon="dlon",
+    color="gap_after",
+    color_continuous_scale=["#22c55e","#f59e0b","#ef4444"],
+    range_color=[0, 50],
+    size="gap_after", size_max=14,
+    hover_name="driver_full_name",
+    hover_data={"gap_after":":.0f","fare":":.2f","dropoff_side":True,"dlat":False,"dlon":False},
+    mapbox_style="carto-positron",
+    zoom=10.2, center={"lat":51.50,"lon":-0.02},
+    height=460,
+    labels={"gap_after":"Gap (min)","fare":"Fare £","dropoff_side":"Side"},
+)
+fig_z3bubble.update_layout(
+    paper_bgcolor="#0f172a",
+    margin=dict(l=0,r=0,t=0,b=0),
+    coloraxis_colorbar=dict(title="Gap min", ticksuffix=" min",
+                            tickfont=dict(color="#e2e8f0"),
+                            title_font=dict(color="#e2e8f0")),
+)
+_add_image(s, _fig_to_img(fig_z3bubble, w=1000, h=460), Inches(0.3), Inches(1.3), Inches(8.0), Inches(5.5))
+
+# Recovery / drift bar — next pickup zone after Z3 East dropoff
+_z3e_next = _zt[(_zt["dropoff_zone"]==3) & (_zt["dropoff_side"]=="East")].dropna(subset=["next_pickup"]).copy()
+if not _z3e_next.empty:
+    _z3e_next["next_zone"] = [assign_zone(lat, lon) for lat, lon in zip(_z3e_next["plat"], _z3e_next["plon"])]
+    _nzc = (_z3e_next["next_zone"].dropna().astype(int)
+              .value_counts().sort_index().reset_index())
+    _nzc.columns = ["Zone","Count"]
+    _nzc["Zone label"] = "Zone " + _nzc["Zone"].astype(str)
+    _nzc["pct"] = (_nzc["Count"] / _nzc["Count"].sum() * 100).round(1)
+
+    fig_drift = px.bar(
+        _nzc, x="Zone label", y="pct",
+        color="Zone label",
+        color_discrete_map={f"Zone {i}": _color_z[i-1] for i in range(1,7)},
+        text="pct",
+        title="Next pickup zone after Z3 East dropoff",
+        labels={"pct":"% of next trips","Zone label":""},
+        height=260,
+    )
+    fig_drift.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+    fig_drift.update_layout(showlegend=False, yaxis_title="% of next trips",
+                             yaxis=dict(range=[0, _nzc["pct"].max()*1.25]),
+                             margin=dict(l=40,r=20,t=50,b=30))
+    _add_image(s, _fig_to_img(fig_drift, w=520, h=260), Inches(8.5), Inches(1.3), Inches(4.6), Inches(3.2))
+
+    _back_z12 = _nzc[_nzc["Zone"] <= 2]["pct"].sum()
+    _stay_z3  = _nzc[_nzc["Zone"] == 3]["pct"].sum()
+    _further  = _nzc[_nzc["Zone"] > 3]["pct"].sum()
+    _metric_card(s, "Recover to Z1/Z2",  f"{_back_z12:.0f}%", Inches(8.5), Inches(4.7),
+                 val_color=C_GREEN, w=Inches(1.45))
+    _metric_card(s, "Stay in Z3",        f"{_stay_z3:.0f}%",  Inches(10.1), Inches(4.7),
+                 val_color=C_AMBER, w=Inches(1.45))
+    _metric_card(s, "Drift to Z4+",      f"{_further:.0f}%",  Inches(11.7), Inches(4.7),
+                 val_color=C_RED,   w=Inches(1.45))
+
+    _callout(s,
+        f"After dropping in Zone 3 East, only {_back_z12:.0f}% of next trips recover to Z1/Z2. "
+        f"{_stay_z3:.0f}% stay in Zone 3. {_further:.0f}% drift further out — Zone 4, 5, or 6. "
+        "These downstream drifts are exactly what accumulate into a lost shift. "
+        "The map shows the hotspots: the red clusters are postcode black holes where drivers "
+        "who land there almost never escape before the hour is up.",
+        Inches(8.5), Inches(5.95), Inches(4.6), Inches(0.9), border_color=C_RED)
 
 # ════════════════════════════════════════════════════════════════════════════
 # SLIDE 8: ZONE 3 NUANCE — DAYTIME TRAP, NIGHT OPPORTUNITY
