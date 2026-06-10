@@ -50,7 +50,7 @@ _PLOTLY_BASE = dict(
 
 def _fig_to_img(fig, w=800, h=440):
     fig.update_layout(**_PLOTLY_BASE)
-    return io.BytesIO(pio.to_image(fig, format="png", width=w, height=h, scale=2))
+    return io.BytesIO(pio.to_image(fig, format="png", width=w, height=h, scale=3))
 
 # ── PPTX helpers ─────────────────────────────────────────────────────────────
 def _new_prs():
@@ -349,7 +349,7 @@ fig_rph.add_vline(x=top_rph, line_dash="dash", line_color="#22c55e",
 fig_rph.add_vline(x=bad_rph, line_dash="dash", line_color="#ef4444",
                   annotation_text=f"Bad avg £{bad_rph:.2f}", annotation_position="bottom right")
 fig_rph.update_layout(showlegend=True, legend=dict(orientation="h",y=1.05))
-_add_image(s, _fig_to_img(fig_rph, w=820, h=390), Inches(0.5), Inches(2.75), Inches(7.8), Inches(4.0))
+_add_image(s, _fig_to_img(fig_rph, w=900, h=430), Inches(0.5), Inches(2.6), Inches(8.1), Inches(4.6))
 
 # Fare comparison bar
 perf_fare = perf_all.sort_values("avg_fare", ascending=True)
@@ -358,13 +358,13 @@ fig_fare2 = px.bar(
     color="group",
     color_discrete_map={"Top drivers": "#22c55e", "Comparison drivers": "#ef4444"},
     text="avg_fare",
-    labels={"avg_fare": "Avg fare per trip (£)", "driver_name": ""},
-    title="Avg fare per trip",
-    height=390,
+    labels={"avg_fare": "Avg fare (£)", "driver_name": ""},
+    title="Avg fare / trip",
+    height=430,
 )
 fig_fare2.update_traces(texttemplate="£%{text:.2f}", textposition="outside")
 fig_fare2.update_layout(showlegend=False)
-_add_image(s, _fig_to_img(fig_fare2, w=520, h=390), Inches(8.5), Inches(2.75), Inches(4.7), Inches(4.0))
+_add_image(s, _fig_to_img(fig_fare2, w=520, h=430), Inches(8.8), Inches(2.6), Inches(4.3), Inches(4.6))
 
 # ════════════════════════════════════════════════════════════════════════════
 # SLIDE 4: EAST vs WEST — THE FUNDAMENTAL SPLIT
@@ -374,49 +374,47 @@ _slide_header(s, "East vs West: The Same City, Two Different Games",
               "West of Charing Cross (−0.12°): premium demand, better fares, cleaner pings. "
               "East: same high-value pings exist — but buried in noise.")
 
-_metric_card(s, "Top drivers — west %",   f"{west_top:.0f}%", Inches(0.5),  Inches(1.4), val_color=C_GREEN)
-_metric_card(s, "Bad drivers — west %",   f"{west_bad:.0f}%", Inches(3.1),  Inches(1.4), val_color=C_RED,
-             delta=f"{west_bad - west_top:+.0f}% vs top", delta_color=C_RED)
-_metric_card(s, "West London avg fare",   f"£{wfare_top:.2f}", Inches(5.7), Inches(1.4), val_color=C_GREEN)
-_metric_card(s, "East London avg fare",   f"£{efare_top:.2f}", Inches(8.3), Inches(1.4), val_color=C_AMBER,
-             delta=f"£{efare_top - wfare_top:.2f} vs west", delta_color=C_RED)
+_metric_card(s, "Top drivers — west %",   f"{west_top:.0f}%",  Inches(0.5),  Inches(1.3), val_color=C_GREEN, w=Inches(2.8))
+_metric_card(s, "Bad drivers — west %",   f"{west_bad:.0f}%",  Inches(3.6),  Inches(1.3), val_color=C_RED,
+             delta=f"{west_bad - west_top:+.0f}% vs top", delta_color=C_RED, w=Inches(2.8))
+_metric_card(s, "West avg fare",           f"£{wfare_top:.2f}", Inches(6.7),  Inches(1.3), val_color=C_GREEN, w=Inches(2.8))
+_metric_card(s, "East avg fare",           f"£{efare_top:.2f}", Inches(9.8),  Inches(1.3), val_color=C_AMBER,
+             delta=f"£{efare_top - wfare_top:.2f} vs west", delta_color=C_RED, w=Inches(2.8))
 
-# Scatter map: top vs bad split
-_add_rect(s, Inches(0.5), Inches(2.7), Inches(5.8), Inches(4.2), fill=C_CARD)
-_add_rect(s, Inches(6.6), Inches(2.7), Inches(6.4), Inches(4.2), fill=C_CARD)
-_add_text(s, "Top drivers — pickup density", Inches(0.6), Inches(2.75), Inches(5.6), Inches(0.35),
-          size=11, bold=True, color=C_GREEN)
-_add_text(s, "Comparison drivers — pickup density", Inches(6.7), Inches(2.75), Inches(6.2), Inches(0.35),
-          size=11, bold=True, color=C_RED)
+# Single combined scatter map — top (green) vs bad (red) pickups
+_ew_sample = pd.concat([
+    acc_top[["plat","plon"]].assign(Group="Top drivers"),
+    acc_bad[["plat","plon"]].assign(Group="Comparison"),
+], ignore_index=True)
+_ew_sample = _ew_sample[_ew_sample["plat"].between(51.3, 51.7) & _ew_sample["plon"].between(-0.55, 0.25)]
+# Sample to keep map readable
+_ew_top = _ew_sample[_ew_sample["Group"]=="Top drivers"].sample(min(600, len(_ew_sample[_ew_sample["Group"]=="Top drivers"])), random_state=42)
+_ew_bad = _ew_sample[_ew_sample["Group"]=="Comparison"].sample(min(600, len(_ew_sample[_ew_sample["Group"]=="Comparison"])), random_state=42)
+_ew_plot = pd.concat([_ew_top, _ew_bad], ignore_index=True)
 
-def _small_map(df, color, title):
-    sample = df[df["plat"].between(51.3,51.7)].copy()
-    fig = px.density_mapbox(
-        sample, lat="plat", lon="plon", radius=10,
-        zoom=9, center={"lat":51.51,"lon":-0.09},
-        mapbox_style="carto-darkmatter",
-        color_continuous_scale=[[0,"rgba(0,0,0,0)"],[1,color]],
-        height=310,
-    )
-    # Add west boundary as a mapbox layer line (vline not supported on mapbox)
-    fig.update_layout(
-        paper_bgcolor="#1e293b", margin=dict(l=0,r=0,t=0,b=0), coloraxis_showscale=False,
-        mapbox_layers=[dict(
-            type="line",
-            coordinates=[[[_WEST_LON, 51.2],[_WEST_LON, 51.8]]],
-            color="#f59e0b", opacity=0.9, line=dict(width=2),
-        )],
-    )
-    return fig
-
-_add_image(s, _fig_to_img(_small_map(acc_top, "#22c55e",""), w=580, h=310),
-           Inches(0.55), Inches(3.1), Inches(5.7), Inches(3.7))
-_add_image(s, _fig_to_img(_small_map(acc_bad, "#ef4444",""), w=580, h=310),
-           Inches(6.65), Inches(3.1), Inches(5.7), Inches(3.7))
-
-_add_text(s, "← West (premium)  |  East (noisy) →",
-          Inches(0.5), Inches(6.9), Inches(13), Inches(0.35),
-          size=10, color=C_AMBER, align=PP_ALIGN.CENTER)
+fig_ew_map = px.scatter_mapbox(
+    _ew_plot, lat="plat", lon="plon", color="Group",
+    color_discrete_map={"Top drivers": "#22c55e", "Comparison": "#ef4444"},
+    zoom=9.8, center={"lat": 51.505, "lon": -0.09},
+    mapbox_style="carto-darkmatter",
+    opacity=0.6, height=420,
+)
+fig_ew_map.update_traces(marker_size=5)
+fig_ew_map.update_layout(
+    paper_bgcolor="#0f172a", margin=dict(l=0, r=0, t=0, b=0),
+    legend=dict(orientation="h", y=0.02, x=0.01, font=dict(color="#e2e8f0", size=12),
+                bgcolor="rgba(15,23,42,0.7)"),
+    mapbox_layers=[dict(
+        type="line",
+        coordinates=[[[_WEST_LON, 51.1], [_WEST_LON, 51.9]]],
+        color="#f59e0b", opacity=1.0, line=dict(width=3),
+    )],
+)
+_add_image(s, _fig_to_img(fig_ew_map, w=1300, h=420),
+           Inches(0.4), Inches(2.55), Inches(12.5), Inches(4.6))
+_add_text(s, "Yellow line = Charing Cross boundary (−0.12°)  ·  Green = top drivers  ·  Red = comparison",
+          Inches(0.4), Inches(7.2), Inches(12.5), Inches(0.25),
+          size=10, color=C_MUTED, italic=True, align=PP_ALIGN.CENTER)
 
 # ════════════════════════════════════════════════════════════════════════════
 # SLIDE 5: SAME STREETS, COMPLETELY DIFFERENT OUTCOMES
@@ -495,20 +493,20 @@ zone_eff = pd.DataFrame([
 fig_z_rph = px.bar(
     zone_eff, x="Zone", y="True RPH £",
     color="True RPH £", color_continuous_scale="RdYlGn",
-    text="True RPH £", title="True RPH by Pickup Zone", height=310,
+    text="True RPH £", title="True RPH by Pickup Zone (incl. wait time)", height=370,
 )
 fig_z_rph.update_traces(texttemplate="£%{text:.0f}", textposition="outside")
-fig_z_rph.update_layout(coloraxis_showscale=False)
-_add_image(s, _fig_to_img(fig_z_rph, w=680, h=310), Inches(0.5), Inches(1.5), Inches(6.2), Inches(3.7))
+fig_z_rph.update_layout(coloraxis_showscale=False, yaxis=dict(range=[0,28]))
+_add_image(s, _fig_to_img(fig_z_rph, w=720, h=370), Inches(0.5), Inches(1.3), Inches(6.2), Inches(4.2))
 
 fig_z_wait = px.bar(
     zone_eff, x="Zone", y="Avg wait (min)",
     color="Avg wait (min)", color_continuous_scale="RdYlGn_r",
-    text="Avg wait (min)", title="Avg Inter-trip Wait by Zone", height=310,
+    text="Avg wait (min)", title="Avg Inter-trip Wait Time by Zone", height=370,
 )
 fig_z_wait.update_traces(texttemplate="%{text} min", textposition="outside")
-fig_z_wait.update_layout(coloraxis_showscale=False)
-_add_image(s, _fig_to_img(fig_z_wait, w=680, h=310), Inches(7.0), Inches(1.5), Inches(6.0), Inches(3.7))
+fig_z_wait.update_layout(coloraxis_showscale=False, yaxis=dict(range=[0,42]))
+_add_image(s, _fig_to_img(fig_z_wait, w=720, h=370), Inches(6.9), Inches(1.3), Inches(6.1), Inches(4.2))
 
 _callout(s,
     "Zone 3 daytime is the trap: £17.50/hr true RPH with a 32-minute average wait for the next ping. "
@@ -686,7 +684,7 @@ fig_fd.add_vline(x=top_med, line_dash="dash", line_color="#22c55e",
 fig_fd.add_vline(x=bad_med, line_dash="dash", line_color="#ef4444",
                  annotation_text=f"Bad £{bad_med:.2f}", annotation_position="top left")
 fig_fd.update_layout(legend=dict(orientation="h", y=1.05))
-_add_image(s, _fig_to_img(fig_fd, w=520, h=310), Inches(8.3), Inches(1.5), Inches(4.8), Inches(4.0))
+_add_image(s, _fig_to_img(fig_fd, w=580, h=380), Inches(8.3), Inches(1.4), Inches(4.8), Inches(4.5))
 
 _callout(s,
     "The Z1 selectivity insight: top drivers park in Z1/Z2 and decline the short-hop, low-fare pings "
