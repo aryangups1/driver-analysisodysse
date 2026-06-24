@@ -38,6 +38,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ── DB connection health check ────────────────────────────────────────────────
+# psycopg2 connections cached via @st.cache_resource go stale after server-side
+# idle timeout. On every rerun, ping with SELECT 1; if the connection is closed,
+# clear the resource cache so get_conn() creates a fresh one on next query.
+try:
+    _hc_conn = db.get_conn()
+    if getattr(_hc_conn, "closed", 0) != 0:
+        raise RuntimeError("connection closed")
+    with _hc_conn.cursor() as _hc_cur:
+        _hc_cur.execute("SELECT 1")
+except Exception:
+    db.get_conn.clear()
+
 # ── Module-level constants ────────────────────────────────────────────────────
 _FLOW_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow_data.parquet")
 _CAT_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver_categories.csv")
