@@ -129,6 +129,40 @@ def _search_drivers(name_fragment):
         LIMIT 30
     """, (f"%{name_fragment}%",))
 
+# ── BYOC helpers ─────────────────────────────────────────────────────────────
+_BYOC_RPH_THRESHOLD = 21.0
+
+_BYOC_SEARCH_KEYS = [
+    ("Mohammed Saiful Islam",     "Saiful"),
+    ("Akeame Plummer",             "Plummer"),
+    ("MD Mamunur Rashid Mahmood", "Mamunur"),
+    ("Emmanuel Kazi Kakai",       "Kakai"),
+    ("Aadil Bouhlaoui",           "Bouhlaoui"),
+    ("Ephrem Fkadu",              "Fkadu"),
+    ("Amjad Ali Jaffery",         "Jaffery"),
+    ("MD Abdul Quayum",           "Quayum"),
+    ("MD Parvej Alom Khan",       "Parvej"),
+    ("Imran Naeem",               "Naeem"),
+]
+
+@st.cache_data(ttl=3600)
+def _byoc_daily_perf(driver_ids):
+    return db.query("""
+        SELECT dim_driver_id,
+               MAX(driver_full_name)                                                AS driver_name,
+               driver_performance_date,
+               SUM(number_of_finished_rides)                                        AS rides,
+               ROUND(SUM(online_time_in_hrs)::numeric, 2)                          AS online_hrs,
+               ROUND(SUM(revenue)::numeric, 2)                                     AS revenue,
+               ROUND((SUM(revenue)/NULLIF(SUM(online_time_in_hrs),0))::numeric,2)  AS rph,
+               ROUND(AVG(utilisation_percent)::numeric, 1)                         AS utilisation,
+               ROUND(AVG(NULLIF(total_acceptance_rate_percent,0))::numeric, 1)     AS acceptance
+        FROM rep_fact_driver_performance
+        WHERE dim_driver_id = ANY(%s) AND online_time_in_hrs > 0
+        GROUP BY dim_driver_id, driver_performance_date
+        ORDER BY dim_driver_id, driver_performance_date
+    """, (list(driver_ids),))
+
 # ── Behavioral analysis loaders (TOP + BAD driver IDs only) ──────────────────
 
 @st.cache_data(ttl=3600)
@@ -329,6 +363,7 @@ with st.sidebar:
         "Zone Analysis",
         "Driver Behavior",
         "Acceptance Rate",
+        "BYOC",
     ])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4177,4 +4212,367 @@ elif page == "Acceptance Rate":
     _fig_hrph.update_xaxes(dtick=1)
     _fig_hrph.update_layout(legend=dict(orientation="h", y=1.1))
     st.plotly_chart(_fig_hrph, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BYOC — BRING YOUR OWN CAR
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "BYOC":
+    st.title("BYOC — Bring Your Own Car")
+    st.caption(
+        "10 drivers who supply their own vehicle. Core question: are they generating enough per hour? "
+        "**RPH = SUM(revenue) ÷ SUM(online_hrs)** — platform-recorded online time, all-time history. "
+        "Threshold: **≥ £21/hr = profitable**. "
+        "Hours worked is shown as a confidence weight — a £28 RPH from 2 hours means very little."
+    )
+
+    # ── 1. Resolve driver names to IDs ───────────────────────────────────────
+    with st.spinner("Resolving BYOC driver names against DB..."):
+        _byoc_resolved: dict = {}   # display_name -> (driver_id, db_name)
+        _byoc_unresolved: list = []
+        for _display, _key in _BYOC_SEARCH_KEYS:
+            _hits = _search_drivers(_key)
+            if _hits.empty:
+                _byoc_unresolved.append(_display)
+                continue
+            if len(_hits) == 1:
+                _r = _hits.iloc[0]
+                _byoc_resolved[_display] = (int(_r["dim_driver_id"]), str(_r["driver_full_name"]))
+            else:
+                _dn_words = set(_display.lower().split())
+                _best, _best_score = None, -1
+                for _, _r in _hits.iterrows():
+                    _s = len(_dn_words & set(str(_r["driver_full_name"]).lower().split()))
+                    if _s > _best_score:
+                        _best_score, _best = _s, _r
+                if _best is not None:
+                    _byoc_resolved[_display] = (int(_best["dim_driver_id"]), str(_best["driver_full_name"]))
+                else:
+                    _byoc_unresolved.append(_display)
+
+    _res_rows = (
+        [{"Name": n, "DB Name": dbname, "ID": did, "Status": "✅ Found"}
+         for n, (did, dbname) in _byoc_resolved.items()] +
+        [{"Name": n, "DB Name": "—", "ID": "—", "Status": "❌ Not found"}
+         for n in _byoc_unresolved]
+    )
+    with st.expander("Name resolution results", expanded=bool(_byoc_unresolved)):
+        st.dataframe(pd.DataFrame(_res_rows), use_container_width=True, hide_index=True)
+
+    if not _byoc_resolved:
+        st.error("No BYOC drivers found in the database.")
+        st.stop()
+
+    _byoc_ids      = [did for _, (did, _) in _byoc_resolved.items()]
+    _id_to_display = {did: name for name, (did, _) in _byoc_resolved.items()}
+
+    # ── 2. Load data ──────────────────────────────────────────────────────────
+    with st.spinner("Loading BYOC performance data..."):
+        _bp  = db.load_comparison_performance(_byoc_ids)
+        _bd  = _byoc_daily_perf(_byoc_ids)
+        _bt  = db.load_comparison_trips(_byoc_ids)
+        _bfl = db.load_fleet_baseline_excluding(_byoc_ids)
+
+    if _bp.empty:
+        st.warning("No performance records found for any BYOC driver. They may have zero completed trips.")
+        st.stop()
+
+    _bp["display_name"] = _bp["dim_driver_id"].map(_id_to_display).fillna(_bp["driver_name"])
+    _bfl_rph = (
+        float(_bfl.iloc[0]["fleet_rph"])
+        if not _bfl.empty and _bfl.iloc[0]["fleet_rph"] is not None
+        else _FLEET_RPH_DEFAULT
+    )
+
+    _active_days_map = _bd.groupby("dim_driver_id").size().to_dict() if not _bd.empty else {}
+    if not _bd.empty:
+        _bd["driver_performance_date"] = pd.to_datetime(_bd["driver_performance_date"])
+
+    # Enrich trip data with coords + zones
+    if not _bt.empty:
+        _bt = _bt.copy()
+        _bt["pickedup_trip_datetime"] = pd.to_datetime(_bt["pickedup_trip_datetime"])
+        _bt["hour"] = _bt["pickedup_trip_datetime"].dt.hour
+        _bt["fare"] = pd.to_numeric(_bt["trip_price_in_pound"], errors="coerce").fillna(0)
+        _bt["dist"] = pd.to_numeric(_bt["distance_in_miles"],   errors="coerce").fillna(0)
+        _bcoords = _bt["pickup_lat_long"].apply(lambda x: parse_dms(str(x or "")))
+        _bt["plat"] = [c[0] for c in _bcoords]
+        _bt["plon"] = [c[1] for c in _bcoords]
+        _bt_valid = _bt.dropna(subset=["plat", "plon"]).copy()
+        _bt_valid["pickup_zone"] = [assign_zone(lat, lon) for lat, lon in zip(_bt_valid["plat"], _bt_valid["plon"])]
+        _bt_valid["is_west"] = _bt_valid["plon"] < _WEST_LON
+    else:
+        _bt_valid = pd.DataFrame()
+
+    # ── 3. Cohort headline metrics ────────────────────────────────────────────
+    st.subheader("Cohort Summary")
+    _above_n   = int((_bp["rph"] >= _BYOC_RPH_THRESHOLD).sum())
+    _total_n   = len(_bp)
+    _w_rph     = float(_bp["total_revenue"].sum() / _bp["online_hrs"].sum()) if _bp["online_hrs"].sum() > 0 else 0.0
+    _tot_hrs   = float(_bp["online_hrs"].sum())
+    _tot_rev   = float(_bp["total_revenue"].sum())
+
+    _cm1, _cm2, _cm3, _cm4, _cm5 = st.columns(5)
+    _cm1.metric("Above £21/hr threshold", f"{_above_n} / {_total_n}")
+    _cm2.metric("Weighted cohort RPH",     f"£{_w_rph:.2f}",
+                delta=f"{_w_rph - _bfl_rph:+.2f} vs fleet", delta_color="normal")
+    _cm3.metric("Total online hours",      f"{_tot_hrs:.0f} hrs")
+    _cm4.metric("Total revenue",           f"£{_tot_rev:,.0f}")
+    _cm5.metric("Fleet avg RPH",           f"£{_bfl_rph:.2f}")
+
+    # ── 4. Summary table ──────────────────────────────────────────────────────
+    st.subheader("Summary Table")
+    st.caption(
+        "**RPH = SUM(revenue) ÷ SUM(online_hrs)** — all-time. "
+        "**Confidence:** 🔴 < 10 hrs (ignore), 🟡 10–50 hrs (indicative), 🟢 > 50 hrs (reliable). "
+        "Sorted by RPH descending."
+    )
+
+    def _conf(h: float) -> str:
+        return "🔴 Low" if h < 10 else ("🟡 Mid" if h < 50 else "🟢 High")
+
+    def _verdict(r: float) -> str:
+        return "✅ Profitable" if r >= _BYOC_RPH_THRESHOLD else (
+            "⚠️ Borderline" if r >= _BYOC_RPH_THRESHOLD * 0.85 else "❌ Loss"
+        )
+
+    _name_to_adays = {name: _active_days_map.get(did, 0) for name, (did, _) in _byoc_resolved.items()}
+    _tbl = _bp[["display_name", "online_hrs", "total_rides", "total_revenue", "rph",
+                "avg_fare", "utilisation", "acceptance"]].copy()
+    _tbl.columns = ["Driver", "Online Hrs", "Trips", "Revenue (£)", "RPH (£)", "Avg Fare (£)", "Util %", "Accept %"]
+    _tbl["Active Days"] = _tbl["Driver"].map(_name_to_adays).fillna(0).astype(int)
+    _tbl["Confidence"]  = _tbl["Online Hrs"].apply(_conf)
+    _tbl["Verdict"]     = _tbl["RPH (£)"].apply(_verdict)
+    _tbl = _tbl.sort_values("RPH (£)", ascending=False).reset_index(drop=True)
+
+    st.dataframe(
+        _tbl.style
+            .background_gradient(subset=["RPH (£)"],    cmap="RdYlGn", vmin=15, vmax=28)
+            .background_gradient(subset=["Online Hrs"], cmap="Blues",   vmin=0,  vmax=max(float(_tbl["Online Hrs"].max()), 1.0))
+            .format({"Revenue (£)": "£{:.2f}", "RPH (£)": "£{:.2f}", "Avg Fare (£)": "£{:.2f}",
+                     "Util %": "{:.1f}%", "Accept %": "{:.1f}%", "Online Hrs": "{:.1f}"}),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ── 5. RPH bar chart ──────────────────────────────────────────────────────
+    st.subheader("RPH vs £21 Threshold")
+    _bar = _bp[["display_name", "rph", "online_hrs"]].copy().sort_values("rph", ascending=True)
+    _bar_colors = _bar["rph"].apply(
+        lambda r: "#22c55e" if r >= _BYOC_RPH_THRESHOLD else ("#f59e0b" if r >= _BYOC_RPH_THRESHOLD * 0.85 else "#ef4444")
+    ).tolist()
+    _fig_rph_bar = go.Figure(go.Bar(
+        x=_bar["rph"].tolist(),
+        y=_bar["display_name"].tolist(),
+        orientation="h",
+        marker_color=_bar_colors,
+        text=[f"£{r:.2f}  ({h:.0f} hrs)" for r, h in zip(_bar["rph"], _bar["online_hrs"])],
+        textposition="outside",
+        hovertemplate="%{y}: £%{x:.2f}/hr<extra></extra>",
+    ))
+    _fig_rph_bar.add_vline(x=_BYOC_RPH_THRESHOLD, line_dash="dash", line_color="#f59e0b",
+                           annotation_text="£21 threshold",          annotation_position="top right")
+    _fig_rph_bar.add_vline(x=_bfl_rph,            line_dash="dot",  line_color="#94a3b8",
+                           annotation_text=f"Fleet £{_bfl_rph:.2f}", annotation_position="bottom right")
+    _fig_rph_bar.update_layout(
+        height=max(320, len(_bar) * 50 + 80),
+        xaxis_title="Revenue per Online Hour (£)",
+        yaxis_title=None,
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(gridcolor="#e2e8f0"),
+    )
+    st.plotly_chart(_fig_rph_bar, use_container_width=True)
+
+    # ── 6. Hours confidence chart ─────────────────────────────────────────────
+    st.subheader("Data Confidence — Hours Worked")
+    st.caption("RPH from 3 hours is noise. RPH from 150 hours is signal. Colour = RPH: red < £21, green ≥ £21.")
+    _hconf = _bp[["display_name", "online_hrs", "rph"]].copy().sort_values("online_hrs", ascending=False)
+    _fig_hconf = px.bar(
+        _hconf, x="display_name", y="online_hrs",
+        color="rph",
+        color_continuous_scale=[[0, "#ef4444"], [0.4, "#f59e0b"], [1, "#22c55e"]],
+        range_color=[14, 28],
+        labels={"display_name": "Driver", "online_hrs": "Online Hours", "rph": "RPH (£)"},
+        title="Total online hours per driver  (colour = RPH)",
+        height=340,
+    )
+    _fig_hconf.add_hline(y=10, line_dash="dash", line_color="#94a3b8", annotation_text="10 hrs — min confidence")
+    _fig_hconf.add_hline(y=50, line_dash="dash", line_color="#60a5fa", annotation_text="50 hrs — high confidence")
+    _fig_hconf.update_layout(plot_bgcolor="rgba(0,0,0,0)", yaxis=dict(gridcolor="#e2e8f0"))
+    st.plotly_chart(_fig_hconf, use_container_width=True)
+
+    # ── 7. Per-driver deep dives ──────────────────────────────────────────────
+    st.subheader("Per-Driver Breakdown")
+
+    for _, _prow in _bp.sort_values("rph", ascending=False).iterrows():
+        _did     = int(_prow["dim_driver_id"])
+        _dname   = str(_prow["display_name"])
+        _rph_d   = float(_prow["rph"]          or 0)
+        _hrs_d   = float(_prow["online_hrs"]   or 0)
+        _rev_d   = float(_prow["total_revenue"] or 0)
+        _trips_d = int(_prow["total_rides"]     or 0)
+        _util_d  = float(_prow["utilisation"]  or 0)
+        _acc_d   = float(_prow["acceptance"]   or 0)
+        _afar_d  = float(_prow["avg_fare"]     or 0)
+        _adays_d = _active_days_map.get(_did, 0)
+        _v_icon  = "✅" if _rph_d >= _BYOC_RPH_THRESHOLD else ("⚠️" if _rph_d >= _BYOC_RPH_THRESHOLD * 0.85 else "❌")
+
+        _dt_all = _bt[_bt["dim_driver_id"] == _did].copy() if not _bt.empty else pd.DataFrame()
+        _dv_all = _bt_valid[_bt_valid["dim_driver_id"] == _did].copy() if not _bt_valid.empty else pd.DataFrame()
+
+        _fare_pm = (
+            float(_dt_all["fare"].sum() / _dt_all["dist"].replace(0, np.nan).sum())
+            if not _dt_all.empty and _dt_all["dist"].sum() > 0 else None
+        )
+
+        with st.expander(
+            f"{_v_icon} {_dname}  ·  £{_rph_d:.2f}/hr  ·  {_hrs_d:.0f} hrs  ·  {_conf(_hrs_d)}",
+            expanded=False,
+        ):
+            # Metric row 1
+            _r1a, _r1b, _r1c, _r1d, _r1e, _r1f = st.columns(6)
+            _r1a.metric("Online Hours",  f"{_hrs_d:.1f}")
+            _r1b.metric("Revenue",       f"£{_rev_d:,.2f}")
+            _r1c.metric("RPH",           f"£{_rph_d:.2f}", delta=f"{_rph_d - _BYOC_RPH_THRESHOLD:+.2f} vs £21")
+            _r1d.metric("Trips",         str(_trips_d))
+            _r1e.metric("Active Days",   str(_adays_d))
+            _r1f.metric("Avg Fare",      f"£{_afar_d:.2f}")
+
+            # Metric row 2
+            _r2a, _r2b, _r2c, _r2d = st.columns(4)
+            _r2a.metric("Utilisation",  f"{_util_d:.1f}%")
+            _r2b.metric("Acceptance",   f"{_acc_d:.1f}%")
+            _r2c.metric("Fare / Mile",  f"£{_fare_pm:.2f}" if _fare_pm is not None else "—")
+            _r2d.metric("Rev / Trip",   f"£{_rev_d / max(_trips_d, 1):.2f}")
+
+            if _dt_all.empty:
+                st.info("No trip records found for this driver.")
+                continue
+
+            # Daily RPH trend (only if > 1 active day)
+            if not _bd.empty:
+                _dd = _bd[_bd["dim_driver_id"] == _did].copy()
+                if len(_dd) > 1:
+                    _fig_dt = px.line(
+                        _dd, x="driver_performance_date", y="rph", markers=True,
+                        title="Daily RPH trend",
+                        labels={"driver_performance_date": "Date", "rph": "RPH (£)"},
+                        height=240,
+                    )
+                    _fig_dt.add_hline(y=_BYOC_RPH_THRESHOLD, line_dash="dash",
+                                      line_color="#f59e0b", annotation_text="£21")
+                    _fig_dt.update_layout(plot_bgcolor="rgba(0,0,0,0)", yaxis=dict(gridcolor="#e2e8f0"))
+                    st.plotly_chart(_fig_dt, use_container_width=True)
+                elif len(_dd) == 1:
+                    st.info(f"Single active day — RPH £{float(_dd.iloc[0]['rph']):.2f}, {float(_dd.iloc[0]['online_hrs']):.1f} hrs.")
+
+            # Three side-by-side charts
+            _ch1, _ch2, _ch3 = st.columns(3)
+
+            with _ch1:
+                _hd = _dt_all.groupby("hour")["fare"].agg(count="count", avg_fare="mean").reset_index()
+                _fig_hr = px.bar(
+                    _hd, x="hour", y="count", color="avg_fare",
+                    color_continuous_scale="RdYlGn", range_color=[8, 25],
+                    title="Trips by hour of day",
+                    labels={"hour": "Hour", "count": "Trips", "avg_fare": "Avg £"},
+                    height=280,
+                )
+                _fig_hr.update_layout(plot_bgcolor="rgba(0,0,0,0)", coloraxis_showscale=False)
+                st.plotly_chart(_fig_hr, use_container_width=True)
+
+            with _ch2:
+                if not _dv_all.empty:
+                    _zc = _dv_all["pickup_zone"].value_counts().reset_index()
+                    _zc.columns = ["Zone", "Trips"]
+                    _fig_zp = px.pie(
+                        _zc, names="Zone", values="Trips",
+                        title="Pickup zone distribution",
+                        height=280,
+                        color_discrete_sequence=px.colors.qualitative.Set2,
+                    )
+                    _fig_zp.update_layout(showlegend=True, legend=dict(orientation="h", y=-0.25))
+                    st.plotly_chart(_fig_zp, use_container_width=True)
+                else:
+                    st.caption("No zone data available.")
+
+            with _ch3:
+                _fb = pd.cut(
+                    _dt_all["fare"],
+                    bins=[0, 10, 15, 20, 30, 999],
+                    labels=["<£10", "£10-15", "£15-20", "£20-30", "£30+"],
+                ).value_counts().reset_index()
+                _fb.columns = ["Fare Band", "Trips"]
+                _fig_fb = px.bar(
+                    _fb, x="Fare Band", y="Trips",
+                    title="Fare distribution",
+                    color="Trips", color_continuous_scale="Blues",
+                    height=280,
+                )
+                _fig_fb.update_layout(plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
+                st.plotly_chart(_fig_fb, use_container_width=True)
+
+            # Quick-read summary line
+            if not _dv_all.empty:
+                _west_pct  = _dv_all["is_west"].mean() * 100
+                _sub10_pct = (_dt_all["fare"] < 10).mean() * 100
+                _avg_dist  = _dt_all["dist"].mean()
+                st.caption(
+                    f"**West %:** {_west_pct:.1f}%  ·  "
+                    f"**Sub-£10 trips:** {_sub10_pct:.1f}%  ·  "
+                    f"**Avg trip distance:** {_avg_dist:.1f} mi"
+                )
+
+    # ── 8. BYOC cohort vs fleet ────────────────────────────────────────────────
+    st.subheader("BYOC Cohort vs Rest of Fleet")
+    _cmp_df = pd.DataFrame({
+        "Group": ["BYOC (weighted)", "Rest of Fleet"],
+        "RPH":   [_w_rph, _bfl_rph],
+    })
+    _fig_cmp = px.bar(
+        _cmp_df, x="Group", y="RPH",
+        color="Group",
+        color_discrete_map={"BYOC (weighted)": "#f59e0b", "Rest of Fleet": "#94a3b8"},
+        text=[f"£{r:.2f}" for r in _cmp_df["RPH"]],
+        title="Weighted average RPH — BYOC cohort vs rest of fleet",
+        height=320,
+        labels={"RPH": "Revenue per Online Hour (£)"},
+    )
+    _fig_cmp.add_hline(y=_BYOC_RPH_THRESHOLD, line_dash="dash", line_color="#ef4444",
+                       annotation_text="£21 threshold")
+    _fig_cmp.update_traces(textposition="outside")
+    _fig_cmp.update_layout(showlegend=False, plot_bgcolor="rgba(0,0,0,0)", yaxis=dict(gridcolor="#e2e8f0"))
+    st.plotly_chart(_fig_cmp, use_container_width=True)
+
+    # ── 9. Pickup map ──────────────────────────────────────────────────────────
+    st.subheader("Pickup Location Map")
+    if not _bt_valid.empty:
+        _BYOC_COLORS = [
+            "#f59e0b", "#3b82f6", "#22c55e", "#ef4444", "#a855f7",
+            "#06b6d4", "#f97316", "#84cc16", "#ec4899", "#14b8a6",
+        ]
+        _byoc_m = folium.Map(location=[CENTER_LAT, CENTER_LON], zoom_start=11, tiles="CartoDB positron")
+        for _ci, _mid in enumerate(_byoc_ids):
+            _dm = _bt_valid[_bt_valid["dim_driver_id"] == _mid]
+            if _dm.empty:
+                continue
+            _dlabel = _id_to_display.get(_mid, str(_mid))
+            _dc = _BYOC_COLORS[_ci % len(_BYOC_COLORS)]
+            _fg = folium.FeatureGroup(name=_dlabel, show=True)
+            for _, _tr in _dm.iterrows():
+                folium.CircleMarker(
+                    location=[_tr["plat"], _tr["plon"]],
+                    radius=4,
+                    color=_dc,
+                    fill=True,
+                    fill_color=_dc,
+                    fill_opacity=0.65,
+                    popup=folium.Popup(f"<b>{_dlabel}</b><br>£{_tr['fare']:.2f}", max_width=160),
+                    tooltip=f"{_dlabel}: £{_tr['fare']:.2f}",
+                ).add_to(_fg)
+            _fg.add_to(_byoc_m)
+        folium.LayerControl().add_to(_byoc_m)
+        st_folium(_byoc_m, use_container_width=True, height=520)
+    else:
+        st.info("No coordinate data available for map.")
 
