@@ -4557,20 +4557,176 @@ elif page == "BYOC":
     _fig_cmp.update_layout(showlegend=False, plot_bgcolor="rgba(0,0,0,0)", yaxis=dict(gridcolor="#e2e8f0"))
     st.plotly_chart(_fig_cmp, use_container_width=True)
 
-    # ── 9. Pickup map ──────────────────────────────────────────────────────────
-    st.subheader("Pickup Location Map")
+    # ── 9. Pickup location analytics + map ────────────────────────────────────
+    st.subheader("Pickup Location Analysis")
+
+    _BYOC_COLORS = [
+        "#f59e0b", "#3b82f6", "#22c55e", "#ef4444", "#a855f7",
+        "#06b6d4", "#f97316", "#84cc16", "#ec4899", "#14b8a6",
+    ]
+    # Map driver IDs to their assigned colour for reuse across charts and map
+    _did_to_color = {
+        _mid: _BYOC_COLORS[_ci % len(_BYOC_COLORS)]
+        for _ci, _mid in enumerate(_byoc_ids)
+    }
+    _did_to_label = {did: _id_to_display.get(did, str(did)) for did in _byoc_ids}
+
     if not _bt_valid.empty:
-        _BYOC_COLORS = [
-            "#f59e0b", "#3b82f6", "#22c55e", "#ef4444", "#a855f7",
-            "#06b6d4", "#f97316", "#84cc16", "#ec4899", "#14b8a6",
-        ]
+        # ── Color legend ────────────────────────────────────────────────────
+        st.caption("**Map colour legend** — each dot on the map is one pickup. Use the layer toggle on the map to show/hide individual drivers.")
+        _legend_html = "".join(
+            f'<span style="display:inline-flex;align-items:center;margin:4px 10px 4px 0;">'
+            f'<span style="width:14px;height:14px;border-radius:50%;background:{_did_to_color[_mid]};'
+            f'display:inline-block;margin-right:6px;flex-shrink:0;"></span>'
+            f'<span style="font-size:13px;">{_did_to_label[_mid]}</span></span>'
+            for _mid in _byoc_ids
+            if not _bt_valid[_bt_valid["dim_driver_id"] == _mid].empty
+        )
+        st.markdown(
+            f'<div style="display:flex;flex-wrap:wrap;padding:8px 12px;'
+            f'background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0;margin-bottom:12px;">'
+            f'{_legend_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Zone concentration ───────────────────────────────────────────────
+        st.markdown("#### Where are they picking up?")
+        st.caption(
+            "London Zones 1–6 (TfL boundaries). Zone 1 = central. "
+            "Higher zones = outer London. 'Airport' = LHR/LGW. "
+            "BYOC drivers tend to cluster where they live or where they start their shift — "
+            "this tells us whether they're gravitating toward premium zones or getting stuck in cheap ones."
+        )
+
+        _zone_driver = (
+            _bt_valid.groupby(["pickup_zone", "dim_driver_id"])
+            .agg(trips=("fare", "count"), avg_fare=("fare", "mean"))
+            .reset_index()
+        )
+        _zone_driver["driver_label"] = _zone_driver["dim_driver_id"].map(_did_to_label)
+        _zone_driver["color"] = _zone_driver["dim_driver_id"].map(_did_to_color)
+
+        # Stacked bar: zone on x, count stacked by driver
+        _fig_zone_stack = px.bar(
+            _zone_driver.sort_values("pickup_zone"),
+            x="pickup_zone", y="trips",
+            color="driver_label",
+            color_discrete_map={_did_to_label[_mid]: _did_to_color[_mid] for _mid in _byoc_ids},
+            barmode="stack",
+            title="Pickup trips by zone — stacked by driver",
+            labels={"pickup_zone": "Zone", "trips": "Trips", "driver_label": "Driver"},
+            height=340,
+        )
+        _fig_zone_stack.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(gridcolor="#e2e8f0"),
+            yaxis=dict(gridcolor="#e2e8f0"),
+            legend=dict(orientation="h", y=-0.3),
+        )
+        st.plotly_chart(_fig_zone_stack, use_container_width=True)
+
+        # Avg fare per zone across all BYOC drivers combined
+        _zone_fare = (
+            _bt_valid.groupby("pickup_zone")["fare"]
+            .agg(avg_fare="mean", trips="count")
+            .reset_index()
+            .sort_values("pickup_zone")
+        )
+        _fig_zone_fare = px.bar(
+            _zone_fare, x="pickup_zone", y="avg_fare",
+            color="avg_fare",
+            color_continuous_scale="RdYlGn", range_color=[10, 28],
+            text=[f"£{v:.0f}" for v in _zone_fare["avg_fare"]],
+            title="Avg fare per pickup zone — all BYOC drivers combined",
+            labels={"pickup_zone": "Zone", "avg_fare": "Avg fare (£)"},
+            height=300,
+        )
+        _fig_zone_fare.add_hline(y=21, line_dash="dash", line_color="#f59e0b",
+                                  annotation_text="£21 RPH target")
+        _fig_zone_fare.update_traces(textposition="outside")
+        _fig_zone_fare.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(gridcolor="#e2e8f0"),
+            yaxis=dict(gridcolor="#e2e8f0"),
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(_fig_zone_fare, use_container_width=True)
+
+        # ── West vs East per driver ──────────────────────────────────────────
+        st.markdown("#### West vs East split")
+        st.caption(
+            "Pickups west of Charing Cross (lon < −0.12°) earn premium fares with less noise. "
+            "East London has high-value pings but they're buried in cheap short-hops. "
+            "BYOC drivers operating mostly east need a stricter acceptance floor to hit £21/hr."
+        )
+
+        _we_driver = (
+            _bt_valid.groupby("dim_driver_id")
+            .agg(
+                total=("fare", "count"),
+                west=("is_west", "sum"),
+                avg_fare=("fare", "mean"),
+            )
+            .reset_index()
+        )
+        _we_driver["west_pct"]  = (_we_driver["west"]  / _we_driver["total"] * 100).round(1)
+        _we_driver["east_pct"]  = (100 - _we_driver["west_pct"]).round(1)
+        _we_driver["label"]     = _we_driver["dim_driver_id"].map(_did_to_label)
+        _we_driver["color"]     = _we_driver["dim_driver_id"].map(_did_to_color)
+        _we_driver = _we_driver.sort_values("west_pct", ascending=False)
+
+        _fig_we = go.Figure()
+        _fig_we.add_trace(go.Bar(
+            name="West (< −0.12°)",
+            x=_we_driver["label"],
+            y=_we_driver["west_pct"],
+            marker_color="#3b82f6",
+            text=[f"{v:.0f}%" for v in _we_driver["west_pct"]],
+            textposition="inside",
+        ))
+        _fig_we.add_trace(go.Bar(
+            name="East",
+            x=_we_driver["label"],
+            y=_we_driver["east_pct"],
+            marker_color="#fb923c",
+            text=[f"{v:.0f}%" for v in _we_driver["east_pct"]],
+            textposition="inside",
+        ))
+        _fig_we.update_layout(
+            barmode="stack",
+            title="West vs East pickup split per driver",
+            yaxis_title="% of pickups",
+            height=340,
+            plot_bgcolor="rgba(0,0,0,0)",
+            yaxis=dict(gridcolor="#e2e8f0"),
+            legend=dict(orientation="h", y=1.1),
+        )
+        st.plotly_chart(_fig_we, use_container_width=True)
+
+        # ── Zone narrative ────────────────────────────────────────────────────
+        _top_zone = _bt_valid["pickup_zone"].value_counts().idxmax()
+        _top_zone_trips = int(_bt_valid["pickup_zone"].value_counts().iloc[0])
+        _top_zone_fare  = float(_bt_valid[_bt_valid["pickup_zone"] == _top_zone]["fare"].mean())
+        _cohort_west_pct = float(_bt_valid["is_west"].mean() * 100)
+        _cohort_avg_fare = float(_bt_valid["fare"].mean())
+
+        st.info(
+            f"**Cohort summary:** {_cohort_west_pct:.0f}% of BYOC pickups are west of Charing Cross. "
+            f"Most concentrated zone is **{_top_zone}** ({_top_zone_trips} trips, avg £{_top_zone_fare:.2f}/trip). "
+            f"Cohort avg fare across all pickups: **£{_cohort_avg_fare:.2f}**. "
+            f"{'Mostly east-based — higher variance, needs disciplined acceptance.' if _cohort_west_pct < 40 else 'Good western coverage — lower noise, more consistent fares.'}"
+        )
+
+        # ── Map ───────────────────────────────────────────────────────────────
+        st.markdown("#### Pickup dot map")
+        st.caption("Each dot = one completed pickup. Click a dot for driver name and fare. Use the layer control (top right) to toggle individual drivers on/off.")
         _byoc_m = folium.Map(location=[CENTER_LAT, CENTER_LON], zoom_start=11, tiles="CartoDB positron")
-        for _ci, _mid in enumerate(_byoc_ids):
+        for _mid in _byoc_ids:
             _dm = _bt_valid[_bt_valid["dim_driver_id"] == _mid]
             if _dm.empty:
                 continue
-            _dlabel = _id_to_display.get(_mid, str(_mid))
-            _dc = _BYOC_COLORS[_ci % len(_BYOC_COLORS)]
+            _dlabel = _did_to_label[_mid]
+            _dc     = _did_to_color[_mid]
             _fg = folium.FeatureGroup(name=_dlabel, show=True)
             for _, _tr in _dm.iterrows():
                 folium.CircleMarker(
@@ -4580,12 +4736,16 @@ elif page == "BYOC":
                     fill=True,
                     fill_color=_dc,
                     fill_opacity=0.65,
-                    popup=folium.Popup(f"<b>{_dlabel}</b><br>£{_tr['fare']:.2f}", max_width=160),
-                    tooltip=f"{_dlabel}: £{_tr['fare']:.2f}",
+                    popup=folium.Popup(
+                        f"<b>{_dlabel}</b><br>Zone {_tr['pickup_zone']}<br>£{_tr['fare']:.2f}",
+                        max_width=160,
+                    ),
+                    tooltip=f"{_dlabel} · Zone {_tr['pickup_zone']} · £{_tr['fare']:.2f}",
                 ).add_to(_fg)
             _fg.add_to(_byoc_m)
         folium.LayerControl().add_to(_byoc_m)
-        st_folium(_byoc_m, use_container_width=True, height=520)
+        st_folium(_byoc_m, use_container_width=True, height=540)
+
     else:
         st.info("No coordinate data available for map.")
 
